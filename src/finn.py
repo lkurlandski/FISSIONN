@@ -1,7 +1,14 @@
 """
 FINN: Fingerprinting Network Flows with Neural Networks.
 
-TODO:
+Notes
+-----
+- The prose in section 4.3 and Table 2 seem to contradict each other. The values
+  used as hyperparameters are unclear for both the encoder and the decoder. This
+  implementation will use the hyperparameters from the prose of section 4.3.
+
+TODO
+----
 - Maybe the encoder would work better if it also had the IPD to operate on?
 """
 
@@ -19,6 +26,10 @@ from torch.nn import functional as F
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
+
+
+class ShapeError(ValueError):
+    ...
 
 
 def seed_everything(seed: int) -> None:
@@ -102,11 +113,10 @@ class FINNEncoder(nn.Module):
 
     def __init__(self, fingerprint_length: int, flow_length: int) -> None:
         super().__init__()
-        self.layer_1 = nn.Linear(fingerprint_length, 1000)
-        self.layer_2 = nn.Linear(1000, 2000)
-        self.layer_3 = nn.Linear(2000, 2000)
-        self.layer_4 = nn.Linear(2000, 500)
-        self.layer_5 = nn.Linear(500, flow_length)
+        self.layer_1 = nn.Linear(fingerprint_length, 128)
+        self.layer_2 = nn.Linear(128, 32)
+        self.layer_3 = nn.Linear(32, 64)
+        self.layer_4 = nn.Linear(64, flow_length)
 
     def forward(self, fingerprint: Tensor) -> Tensor:
         x = self.layer_1(fingerprint)
@@ -116,28 +126,50 @@ class FINNEncoder(nn.Module):
         x = self.layer_3(x)
         x = F.relu(x)
         x = self.layer_4(x)
-        x = F.relu(x)
-        x = self.layer_5(x)
         return x
 
 
 class FINNDecoder(nn.Module):
 
-    def __init__(self, fingerprint_length: int, flow_length: int) -> None:
+    def __init__(
+        self,
+        fingerprint_length: int,
+        flow_length: int,
+        conv_1_channels: int = 50,
+        conv_2_channels: int = 10,
+        kernel_size: int = 10,
+        stride: int = 10,
+        mlp_hidden_size: int = 256,
+    ) -> None:
         super().__init__()
-        self.conv_1 = nn.Conv1d(1, 50, 10, stride=1)
-        self.conv_2 = nn.Conv1d(50, 10, 10, stride=1)
-        self.mlp_1 = nn.Linear(820, 256)
-        self.mlp_2 = nn.Linear(256, 256)
+        self.fingerprint_length = fingerprint_length
+        self.flow_length = flow_length
+
+        self.conv_1 = nn.Conv1d(1, conv_1_channels, kernel_size, stride=stride)
+        self.conv_2 = nn.Conv1d(conv_1_channels, conv_2_channels, kernel_size, stride=stride)
+        self.mlp_1 = nn.Linear(self.compute_mlp_input_size(conv_2_channels, kernel_size, stride), mlp_hidden_size)
+        self.mlp_2 = nn.Linear(mlp_hidden_size, fingerprint_length)
+
+    def compute_mlp_input_size(self, conv_2_channels: int, kernel_size: int, stride: int) -> int:
+        output_length_1 = (self.flow_length - kernel_size) // stride + 1
+        output_length_2 = (output_length_1 - kernel_size) // stride + 1
+        return conv_2_channels * output_length_2
 
     def forward(self, noisy_marked_ipd: Tensor) -> Tensor:
-        x = noisy_marked_ipd.unsqueeze(1)
+        if noisy_marked_ipd.dim() != 2 or noisy_marked_ipd.shape[1] != self.flow_length:
+            raise ShapeError()
+
+        x = noisy_marked_ipd
+        x = x.unsqueeze(1)
         x = self.conv_1(x)
         x = self.conv_2(x)
         x = x.flatten(start_dim=1)
         x = self.mlp_1(x)
         x = F.relu(x)
         x = self.mlp_2(x)
+
+        if x.shape[1] != self.fingerprint_length:
+            raise ShapeError()
         return x
 
 
@@ -265,12 +297,13 @@ def main():
     seed_everything(0)
 
     fingerprint_length = 256
-    flow_length = 100
+    flow_length = 9090
 
     dataset = FINNDataset(fingerprint_length=fingerprint_length, flow_length=flow_length)
     tr_dataset, ts_dataset = random_split(dataset, [0.80, 0.20])
     model = FINNModel(fingerprint_length, flow_length)
-    args = FINNTrainerArgs(num_train_epochs=64, dataloader_num_workers=4, batch_size=256, device=torch.device("cuda:0"))
+    print(model)
+    args = FINNTrainerArgs(num_train_epochs=1, dataloader_num_workers=0, batch_size=11, device=torch.device("cpu"))
     trainer = FINNTrainer(args, model, tr_dataset, ts_dataset)
     trainer()
 
