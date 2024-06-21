@@ -7,18 +7,21 @@ Next, decompress all the pcap files.
 > find . -name "*.gz" -type f -print0 | xargs -0 gunzip ???
 """
 
+from array import array
 from argparse import ArgumentParser
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 import gzip
 import json
 import os
 from pathlib import Path
+import pickle
 from pprint import pformat, pprint
 import multiprocessing as mp
 import shutil
 import sys
 from tempfile import NamedTemporaryFile
 import time
+from typing import Generator, NamedTuple
 
 import dpkt
 from scapy.all import rdpcap
@@ -43,7 +46,7 @@ def extract_flows(f: Path) -> dict[tuple, np.ndarray]:
     flows = defaultdict(list)
     cap = pyshark.FileCapture(f, keep_packets=False, use_json=True)
     try:
-        for i, packet in enumerate(cap):
+        for _, packet in enumerate(cap):
             try:
                 if "IP" in packet:
                     ip_src = packet.ip.src
@@ -82,19 +85,22 @@ def compute_ipds(flows: dict[tuple, np.ndarray]) -> dict[tuple, np.ndarray]:
     return ipds
 
 
+class CaidaSample(NamedTuple):
+    source_ip: str
+    destination_ip: str
+    source_port: int
+    destination_port: int
+    protocol: int
+    ipds: array
+
+
 def save_ipds(ipds: dict[tuple, np.ndarray], f: Path) -> None:
-    with open(f, "w") as fp:
-        for flow_key, delays in ipds.items():
-            d = {
-                "source_ip": flow_key[0],
-                "destination_ip": flow_key[1],
-                "source_port": flow_key[2],
-                "destination_port": flow_key[3],
-                "protocol": flow_key[4],
-                "ipds": delays.tolist(),
-            }
-            s = json.dumps(d)
-            fp.write(s + "\n")
+    data = []
+    for flow_key, delays in ipds.items():
+        sample = CaidaSample(*flow_key, array("f", delays.tolist()))
+        data.append(sample)
+    with open(f, "wb") as fp:
+        pickle.dump(data, fp)
 
 
 def process_file(input_file: Path, output_file: Path) -> None:
@@ -111,6 +117,47 @@ def process_file(input_file: Path, output_file: Path) -> None:
         print(f"Worker {os.getpid()} failed to process {input_file} because of {type(err)}.\n{err=}")
 
 
+def _json_to_pickle(f_json: Path, remove: bool) -> None:
+        print(f"Worker {os.getpid()} processing {str(f_json)}")
+        data = []
+        with open(f_json, "r") as fp:
+            for line in fp:
+                d = json.loads(line.strip())
+                d["ipds"] = array("f", d["ipds"])
+                data.append(d)
+        f_pickle = f_json.with_suffix(".pickle")
+        data = [CaidaSample(*d.values()) for d in data]
+        with open(f_pickle, "wb") as fp:
+            pickle.dump(data, fp)
+        if remove:
+            f_json.unlink()
+
+
+def json_to_pickle(
+    output: Path = Path("./data"),
+    year: str = "passive-2016",
+    source: str = "equinix-chicago",
+    remove: bool = False
+) -> None:
+    output_root = output / year / source
+    files = sorted(list(output_root.glob("*.json")))
+    with mp.Pool(8) as pool:
+        pool.starmap(_json_to_pickle, [(f, remove) for f in files])
+
+
+def stream_caida_data(
+    output: Path = Path("./data"),
+    year: str = "passive-2016",
+    source: str = "equinix-chicago",
+) -> Generator[CaidaSample, None, None]:
+    output_root = output / year / source
+    for f in output_root.rglob("*.pickle"):
+        with open(f, "rb") as fp:
+            data = pickle.load(fp)
+        for sample in data:
+            yield sample
+
+
 def main() -> None:
 
     parser = ArgumentParser()
@@ -123,9 +170,18 @@ def main() -> None:
     input_root: Path = CAIDA_ROOT_PATH / args.year / args.source
     output_root = args.output / args.year / args.source
     input_files = list(input_root.rglob("*.pcap.gz"))
-    output_files = [output_root / f"{f.stem}.json" for f in input_files]
+    output_files = [output_root / f"{f.stem}.pickle" for f in input_files]
 
-    print(f"Extracting IPDs from {len(input_files)} files...")
+    print(f"Found {len(input_files)} files to extract IPDs from. Saving to {str(output_root)}.")
+
+    complete = []
+    for i, output_file in enumerate(output_files):
+        if output_file.exists():
+            complete.append(i)
+    input_files = [f for i, f in enumerate(input_files) if i not in complete]
+    output_files = [f for i, f in enumerate(output_files) if i not in complete]
+
+    print(f"Found {len(complete)} files already processed. Processing {len(input_files)} files...")
 
     if args.num_workers < 2:
         for input_file, output_file in tqdm(zip(input_files, output_files), total=len(input_files)):
@@ -133,6 +189,7 @@ def main() -> None:
     else:
         with mp.Pool(args.num_workers) as pool:
             pool.starmap(process_file, zip(input_files, output_files))
+
 
 if __name__ == "__main__":
     main()
