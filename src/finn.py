@@ -26,7 +26,7 @@ import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import torch
 from torch import nn, Tensor, tensor
-from torch.distributions import Laplace
+from torch.distributions import Laplace, Uniform, Normal
 from torch.nn import functional as F
 from torch.optim import Adam
 from torch.nn.utils.rnn import pad_sequence
@@ -37,6 +37,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_ipds
+from src.caida import stream_caida_data
 
 
 class ShapeError(ValueError):
@@ -56,11 +57,11 @@ def seed_everything(seed: int) -> None:
 
 class FINNDataset(Dataset):
 
-    def __init__(self, fingerprint_length: int) -> None:
+    def __init__(self, ipds: list[np.ndarray], fingerprint_length: int) -> None:
         self.fingerprint_length = fingerprint_length
         self.sampler_delay = Laplace(0, 10)  # TODO: is this alpha? Figure out the sampling...
         self.sampler_noise = Laplace(0, 10)  # TODO: is this sigma? Figure out the sampling...
-        self.ipds = [tensor(ipd, dtype=torch.float32) for ipd in load_ipds()]
+        self.ipds = ipds
 
     def __len__(self) -> int:
         return len(self.ipds)
@@ -286,6 +287,7 @@ class FINNModel(nn.Module):
         delay: Tensor = self.encoder(fingerprint_and_noise)
         # TODO: the paper is ambiguous about the input to the decoder.
         noisy_marked_ipd = ipd + torch.cumsum(delay, dim=0) + noise
+        # noisy_marked_ipd = ipd + delay + noise
         fingerprint = self.decoder(noisy_marked_ipd)
 
         return FINNModelOutput(delay, fingerprint)
@@ -397,11 +399,13 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--device", type=torch.device, default="cpu")
+    parser.add_argument("--num_samples", type=int, default=sys.maxsize)
     args = parser.parse_args()
 
     pprint(args.__dict__)
 
-    dataset = FINNDataset(args.fingerprint_length)
+    ipds = [np.array(sample.ipds) for sample in slice(stream_caida_data(), args.num_samples)]
+    dataset = FINNDataset(ipds, args.fingerprint_length)
     tr_dataset, ts_dataset = random_split(dataset, [0.80, 0.20])
     model = FINNModel(args.fingerprint_length, args.flow_length)
     training_args = FINNTrainerArgs(
