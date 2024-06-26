@@ -6,7 +6,7 @@ import math
 from pprint import pformat
 
 import torch
-from torch import tensor, Tensor
+from torch import tensor, Tensor, nn
 
 
 def one_hot_to_binary(x: Tensor) -> Tensor:
@@ -34,6 +34,10 @@ def one_hot_to_binary(x: Tensor) -> Tensor:
         indices = indices // 2
 
     return binary
+
+
+def count_parameters(model: nn.Module, requires_grad: bool = False) -> int:
+    return sum(p.numel() for p in model.parameters() if (not requires_grad or p.requires_grad))
 
 
 def test():

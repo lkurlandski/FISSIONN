@@ -38,7 +38,11 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.caida import stream_caida_data
-from src.utils import one_hot_to_binary
+from src.utils import count_parameters, one_hot_to_binary
+
+
+DISABLE_NOISE: Optional[bool] = None
+DISABLE_DELAY: Optional[bool] = None
 
 
 class ShapeError(ValueError):
@@ -95,6 +99,10 @@ class FINNDataset(Dataset):
         fingerprint = torch.eye(self.fingerprint_length)[torch.randint(self.fingerprint_length, (1,))].squeeze(0)
         delay = self.sampler_delay.sample((len(ipd),)).abs()
         noise = self.noise_sampler.sample((len(ipd),)).abs()
+
+        delay = delay if not DISABLE_DELAY else torch.zeros((len(ipd),))
+        noise = noise if not DISABLE_NOISE else torch.zeros((len(ipd),))
+
         return fingerprint, ipd, delay, noise
 
 
@@ -199,10 +207,10 @@ class FINNEncoder(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.layer_1 = nn.Linear(input_size, 128)
-        self.layer_2 = nn.Linear(128, 32)
-        self.layer_3 = nn.Linear(32, 64)
-        self.layer_4 = nn.Linear(64, output_size)
+        self.layer_1 = nn.Linear(input_size, 1024)
+        self.layer_2 = nn.Linear(1024, 2048)
+        self.layer_3 = nn.Linear(2048, 512)
+        self.layer_4 = nn.Linear(512, output_size)
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -239,8 +247,9 @@ class FINNDecoder(nn.Module):
         self.output_size = output_size
         self.conv_1 = nn.Conv1d(1, 50, 10, stride=1)
         self.conv_2 = nn.Conv1d(50, 10, 10, stride=1)
-        self.mlp_1 = nn.Linear(self.compute_mlp_input_size(), 256)
-        self.mlp_2 = nn.Linear(256, self.output_size)
+        self.mlp_1 = nn.Linear(self.compute_mlp_input_size(), 1024)
+        self.mlp_2 = nn.Linear(1024, 2048)
+        self.mlp_3 = nn.Linear(2048, self.output_size)
 
     def compute_mlp_input_size(self) -> int:
         output_length_1 = (self.input_size - self.conv_1.kernel_size[0]) // self.conv_1.stride[0] + 1
@@ -266,6 +275,8 @@ class FINNDecoder(nn.Module):
         x = self.mlp_1(x)
         x = F.relu(x)
         x = self.mlp_2(x)
+        x = F.relu(x)
+        x = self.mlp_3(x)
 
         return x
 
@@ -441,15 +452,26 @@ def main():
     parser.add_argument("--device", type=torch.device, default="cpu")
     parser.add_argument("--num_samples", type=int, default=sys.maxsize, help="{200000, 500000}")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--disable_noise", action="store_true")
+    parser.add_argument("--disable_delay", action="store_true")
     args = parser.parse_args()
 
     pprint(args.__dict__)
 
-    seed_everything(0)
+    global DISABLE_NOISE, DISABLE_DELAY
+    DISABLE_NOISE = args.disable_noise
+    DISABLE_DELAY = args.disable_delay
+
+    seed_everything(args.seed)
+
     ipds = [np.array(sample.ipds) for sample in islice(stream_caida_data(), args.num_samples)]
     dataset = FINNDataset(ipds, args.fingerprint_length, args.amplitude, args.noise_deviation_low, args.noise_deviation_high)
     tr_dataset, ts_dataset = random_split(dataset, [0.80, 0.20])
     model = FINNModel(args.fingerprint_length, args.flow_length)
+    print(f"Number of parameters:")
+    print(f"\tTotal: {round(count_parameters(model) / 1e6, 2)}M")
+    print(f"\tEncoder: {round(count_parameters(model.encoder) / 1e6, 2)}M")
+    print(f"\tDecoder: {round(count_parameters(model.decoder) / 1e6, 2)}M")
     training_args = FINNTrainerArgs(
         num_train_epochs=args.num_train_epochs,
         batch_size=args.batch_size,
