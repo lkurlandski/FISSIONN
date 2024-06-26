@@ -1,7 +1,7 @@
 """
 FINN: Fingerprinting Network Flows with Neural Networks.
 
-TODO
+NOTE
 ----
 - There is ambiguity about what the input to the encoder is. Eequation 1 indicates that the input to
   the encoder is the fingerprint concatenated with the network noise, but the first paragraph in
@@ -16,11 +16,12 @@ TODO
 from __future__ import annotations
 from argparse import ArgumentParser
 from dataclasses import dataclass
+from itertools import islice
 import os
 from pprint import pprint
 import random
 import sys
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
@@ -36,8 +37,8 @@ from tqdm import tqdm
 if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.data import load_ipds
 from src.caida import stream_caida_data
+from src.utils import one_hot_to_binary
 
 
 class ShapeError(ValueError):
@@ -56,12 +57,25 @@ def seed_everything(seed: int) -> None:
 
 
 class FINNDataset(Dataset):
+    # TODO: the manner to produce noise is highly ambigious.
 
-    def __init__(self, ipds: list[np.ndarray], fingerprint_length: int) -> None:
+    def __init__(
+        self,
+        ipds: list[np.ndarray],
+        fingerprint_length: int,
+        amplitude: int,
+        noise_deviation_low: int,
+        noise_deviation_high: int,
+    ) -> None:
         self.fingerprint_length = fingerprint_length
-        self.sampler_delay = Laplace(0, 10)  # TODO: is this alpha? Figure out the sampling...
-        self.sampler_noise = Laplace(0, 10)  # TODO: is this sigma? Figure out the sampling...
+        self.amplitude = amplitude
+        self.sampler_uniform = Uniform(noise_deviation_low, noise_deviation_high)
+        self.sampler_delay = Laplace(loc=0, scale=amplitude)
         self.ipds = ipds
+
+    @property
+    def noise_sampler(self) -> Normal:
+        return Laplace(loc=0, scale=self.sampler_uniform.sample().item())
 
     def __len__(self) -> int:
         return len(self.ipds)
@@ -77,10 +91,10 @@ class FINNDataset(Dataset):
           delay: The fingerprint delay of the flow.
           noise: The noise to add to the flow.
         """
-        ipd = self.ipds[idx]
+        ipd = torch.from_numpy(self.ipds[idx])
         fingerprint = torch.eye(self.fingerprint_length)[torch.randint(self.fingerprint_length, (1,))].squeeze(0)
-        delay = self.sampler_delay.sample((len(ipd),))
-        noise = self.sampler_noise.sample((len(ipd),))
+        delay = self.sampler_delay.sample((len(ipd),)).abs()
+        noise = self.noise_sampler.sample((len(ipd),)).abs()
         return fingerprint, ipd, delay, noise
 
 
@@ -211,6 +225,8 @@ class FINNEncoder(nn.Module):
 
 
 class FINNDecoder(nn.Module):
+    # TODO: Should the CNN layers be 2D CNNs? The paper seems to indicate this,
+    # but such a choice is nonsensical given the nature of the decoder input.
 
     def __init__(self, input_size: int, output_size: int) -> None:
         """
@@ -221,8 +237,8 @@ class FINNDecoder(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.conv_1 = nn.Conv1d(1, 50, 10, stride=10)
-        self.conv_2 = nn.Conv1d(50, 10, 10, stride=10)
+        self.conv_1 = nn.Conv1d(1, 50, 10, stride=1)
+        self.conv_2 = nn.Conv1d(50, 10, 10, stride=1)
         self.mlp_1 = nn.Linear(self.compute_mlp_input_size(), 256)
         self.mlp_2 = nn.Linear(256, self.output_size)
 
@@ -243,7 +259,9 @@ class FINNDecoder(nn.Module):
 
         x = x.unsqueeze(1)
         x = self.conv_1(x)
+        x = F.relu(x)
         x = self.conv_2(x)
+        x = F.relu(x)
         x = x.flatten(start_dim=1)
         x = self.mlp_1(x)
         x = F.relu(x)
@@ -282,15 +300,21 @@ class FINNModel(nn.Module):
         if noise.dim() != 2 or noise.shape[1] != self.flow_length:
             raise ShapeError(noise.shape, ("*", self.flow_length))
 
-        # TODO: the paper is ambiguous about the input to the encoder.
         fingerprint_and_noise = torch.cat((fingerprint, noise), dim=1)
         delay: Tensor = self.encoder(fingerprint_and_noise)
-        # TODO: the paper is ambiguous about the input to the decoder.
-        noisy_marked_ipd = ipd + torch.cumsum(delay, dim=0) + noise
-        # noisy_marked_ipd = ipd + delay + noise
+        noisy_marked_ipd = self.combine_3(ipd, delay, noise)
         fingerprint = self.decoder(noisy_marked_ipd)
 
         return FINNModelOutput(delay, fingerprint)
+
+    def combine_1(self, ipd: Tensor, delay: Tensor, noise: Tensor) -> Tensor:
+        return ipd + delay + noise
+
+    def combine_2(self, ipd: Tensor, delay: Tensor, noise: Tensor) -> Tensor:
+        return ipd + torch.cumsum(delay, dim=0) + noise
+
+    def combine_3(self, ipd: Tensor, delay: Tensor, noise: Tensor) -> Tensor:
+        return ipd + torch.cumsum(delay, dim=0) + torch.cumsum(noise, dim=0)
 
 
 @dataclass
@@ -322,6 +346,12 @@ class FINNTrainer:
         self.loss_fn = FINNLoss(encoder_weight=1.0, decoder_weight=5.0)
 
     def __call__(self) -> None:
+
+        vl_loss, metrics = self.evaluate()
+        d = {"epoch": 0, "tr_loss": float("nan"), "vl_loss": vl_loss} | metrics
+        d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
+        print(d)
+
         for epoch in tqdm(range(1, self.args.num_train_epochs + 1), desc="Epochs"):
             tr_loss = self.train()
             vl_loss, metrics = self.evaluate()
@@ -354,7 +384,7 @@ class FINNTrainer:
 
     def evaluate(self) -> tuple[float, dict[str, float]]:
         self.model.eval()
-        cum_loss, y_true, y_pred = 0, [], []
+        cum_loss, bit_errors, y_true, y_pred = 0, 0, [], []
         dataloader = self.get_dataloader(self.vl_dataset, shuffle=False)
         pbar = tqdm(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
         for batch in pbar:
@@ -367,14 +397,22 @@ class FINNTrainer:
             output = self.model.forward(fingerprint, ipd, noise)
             loss: Tensor = self.loss_fn.forward(output.delay, delay, output.fingerprint, fingerprint)
             predictions = F.softmax(output.fingerprint, dim=-1)
+
+            one_hot_predictions = torch.zeros_like(predictions)
+            one_hot_predictions[torch.arange(len(predictions)), torch.argmax(predictions, dim=1)] = 1
+            binary_fingerprint = one_hot_to_binary(fingerprint).to(bool)
+            binary_predictions = one_hot_to_binary(one_hot_predictions).to(bool)
+            bit_difference = binary_fingerprint ^ binary_predictions
+            bit_errors += bit_difference.sum().item()
+    
             cum_loss += loss.item()
+
             y_true.extend(torch.argmax(fingerprint, dim=1).tolist())
             y_pred.extend(torch.argmax(predictions, dim=1).tolist())
 
         metrics = {
-            "accuracy": accuracy_score(y_true, y_pred),
-            "f1-weighted": f1_score(y_true, y_pred, average="weighted"),
-            "f1-macro": f1_score(y_true, y_pred, average="macro"),
+            "extraction_rate": accuracy_score(y_true, y_pred),
+            "bit_error_rate": bit_errors / len(y_pred),
         }
 
         return cum_loss / len(y_pred), metrics
@@ -390,22 +428,26 @@ class FINNTrainer:
 
 
 def main():
-    seed_everything(0)
 
     parser = ArgumentParser()
-    parser.add_argument("--fingerprint_length", type=int, default=64)
-    parser.add_argument("--flow_length", type=int, default=256)
-    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--fingerprint_length", type=int, default=512, help="ℓ ∈ {512, 1024, 2048, 4096, 8192, 16384}")
+    parser.add_argument("--flow_length", type=int, default=50, help="N ∈ {50, 100, 150}")
+    parser.add_argument("--amplitude", type=int, default=40, help="α ∈ {5, 10, 20, 30, 40}")
+    parser.add_argument("--noise_deviation_low", type=int, default=2, help="σ ∈ {(2, 10), (10, 20), (20, 30)}")
+    parser.add_argument("--noise_deviation_high", type=int, default=10, help="σ ∈ {(2, 10), (10, 20), (20, 30)}")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help="{100, 150 200}")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--device", type=torch.device, default="cpu")
-    parser.add_argument("--num_samples", type=int, default=sys.maxsize)
+    parser.add_argument("--num_samples", type=int, default=sys.maxsize, help="{200000, 500000}")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     pprint(args.__dict__)
 
-    ipds = [np.array(sample.ipds) for sample in slice(stream_caida_data(), args.num_samples)]
-    dataset = FINNDataset(ipds, args.fingerprint_length)
+    seed_everything(0)
+    ipds = [np.array(sample.ipds) for sample in islice(stream_caida_data(), args.num_samples)]
+    dataset = FINNDataset(ipds, args.fingerprint_length, args.amplitude, args.noise_deviation_low, args.noise_deviation_high)
     tr_dataset, ts_dataset = random_split(dataset, [0.80, 0.20])
     model = FINNModel(args.fingerprint_length, args.flow_length)
     training_args = FINNTrainerArgs(
