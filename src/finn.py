@@ -1,16 +1,14 @@
 """
-FINN: Fingerprinting Network Flows with Neural Networks.
+Implementation of the network watermarking technique, "FINN".
 
-NOTE
-----
-- There is ambiguity about what the input to the encoder is. Eequation 1 indicates that the input to
-  the encoder is the fingerprint concatenated with the network noise, but the first paragraph in
-  section 4.1 states "The encoder takes IPDs and fingerprints to generate fingerprinting delays"
-  which indicates that the encoder takes the fingerprint and the IPDs as input.
-- There is ambiguity about the sizes of individual layers in the paper, specifically, the prose in
-  section 4.3 and the values given in Table 2 seem to contradict each other. This implementation
-  will use the values discusses in the prose of section 4.3.
-- There is major ambiguity about how to create the noise and the delays for training!!!
+CITATION
+--------
+@inproceedings{rezaei2021finn,
+  title={FINN: Fingerprinting network flows using neural networks},
+  author={Rezaei, Fatemeh and Houmansadr, Amir},
+  booktitle={Proceedings of the 37th Annual Computer Security Applications Conference},
+  year={2021}
+}
 """
 
 from __future__ import annotations
@@ -22,10 +20,10 @@ import os
 from pprint import pprint
 import random
 import sys
-from typing import Callable, Literal, Optional
+from typing import Literal, Optional
 
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score
 import torch
 from torch import nn, Tensor, tensor
 from torch.distributions import Laplace, Uniform, Normal
@@ -35,10 +33,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
+# pylint-disable: wrong-import-position
 if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# pylint-enable: wrong-import-position
 
-from src.data import stream_synthetic_data
 from src.caida import stream_caida_data
 from src.utils import count_parameters, one_hot_to_binary
 
@@ -64,7 +63,9 @@ def seed_everything(seed: int) -> None:
 
 
 class FINNDataset(Dataset):
-    # TODO: the manner to produce noise is highly ambigious.
+    # TODO: the manner to produce noise is a tad ambigious.
+    # This implementation uses a uniform distribution to sample the noise deviation.
+    # This noise deviation is then used as the `scale` of the Laplace distribition to sample the noise.
 
     def __init__(
         self,
@@ -203,6 +204,13 @@ class FINNLoss(nn.Module):
 
 
 class FINNEncoder(nn.Module):
+    # TODO: There is ambiguity about what the input to the encoder is.
+    # Eequation 1 indicates that the input to the encoder is the fingerprint
+    # concatenated with the network noise, but the first paragraph in
+    # section 4.1 states "The encoder takes IPDs and fingerprints to generate fingerprinting delays"
+    # which indicates that the encoder takes the fingerprint and the IPDs as input.
+    # TODO: There is ambiguity about the sizes of individual layers in the paper,
+    # specifically, the prose in section 4.3 and the values given in Table 2 contradict.
 
     def __init__(self, input_size: int, output_size: int) -> None:
         """
@@ -457,7 +465,7 @@ class FINNTrainer:
             binary_predictions = one_hot_to_binary(one_hot_predictions).to(bool)
             bit_difference = binary_fingerprint ^ binary_predictions
             bit_errors += bit_difference.sum().item()
-    
+
             cum_samples += fingerprint.size(0)
             cum_weighted_loss += weighted_loss.item()
             cum_encoder_loss += encoder_loss.item()
