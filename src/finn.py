@@ -14,7 +14,7 @@ NOTE
 """
 
 from __future__ import annotations
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter
 from dataclasses import dataclass
 from itertools import islice
 import os
@@ -440,20 +440,20 @@ class FINNTrainer:
 
 def main():
 
-    parser = ArgumentParser()
-    parser.add_argument("--fingerprint_length", type=int, default=512, help="ℓ ∈ {512, 1024, 2048, 4096, 8192, 16384}")
-    parser.add_argument("--flow_length", type=int, default=50, help="N ∈ {50, 100, 150}")
-    parser.add_argument("--amplitude", type=int, default=40, help="α ∈ {5, 10, 20, 30, 40}")
-    parser.add_argument("--noise_deviation_low", type=int, default=2, help="σ ∈ {(2, 10), (10, 20), (20, 30)}")
-    parser.add_argument("--noise_deviation_high", type=int, default=10, help="σ ∈ {(2, 10), (10, 20), (20, 30)}")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help="{100, 150 200}")
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--dataloader_num_workers", type=int, default=0)
-    parser.add_argument("--device", type=torch.device, default="cpu")
-    parser.add_argument("--num_samples", type=int, default=sys.maxsize, help="{200000, 500000}")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--disable_noise", action="store_true")
-    parser.add_argument("--disable_delay", action="store_true")
+    parser = ArgumentParser(formatter_class=type("F", (ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter), {}))
+    parser.add_argument("--fingerprint_length", type=int, default=512, help="ℓ")  # {512, 1024, 2048, 4096, 8192, 16384}
+    parser.add_argument("--flow_length", type=int, default=50, help="N")  # {50, 100, 150}
+    parser.add_argument("--amplitude", type=int, default=40, help="α")  # {5, 10, 20, 30, 40}
+    parser.add_argument("--noise_deviation_low", type=float, default=2 / 1e3, help="σ")  # {(2, 10), (10, 20), (20, 30)}
+    parser.add_argument("--noise_deviation_high", type=float, default=10 / 1e3, help="σ")  # σ {(2, 10), (10, 20), (20, 30)}
+    parser.add_argument("--num_train_epochs", type=int, default=1, help=".")  # {100, 150 200}
+    parser.add_argument("--num_samples", type=int, default=sys.maxsize, help=".")  # {200000, 500000}
+    parser.add_argument("--batch_size", type=int, default=2, help=".")
+    parser.add_argument("--dataloader_num_workers", type=int, default=0, help=".")
+    parser.add_argument("--device", type=torch.device, default="cpu", help=".")
+    parser.add_argument("--seed", type=int, default=0, help=".")
+    parser.add_argument("--disable_noise", action="store_true", help=".")
+    parser.add_argument("--disable_delay", action="store_true", help=".")
     args = parser.parse_args()
 
     pprint(args.__dict__)
