@@ -465,13 +465,21 @@ def main():
     seed_everything(args.seed)
 
     ipds = [np.array(sample.ipds) for sample in islice(stream_caida_data(), args.num_samples)]
-    dataset = FINNDataset(ipds, args.fingerprint_length, args.amplitude, args.noise_deviation_low, args.noise_deviation_high)
+    dataset = FINNDataset(
+        ipds,
+        args.fingerprint_length,
+        args.amplitude,
+        args.noise_deviation_low,
+        args.noise_deviation_high,
+    )
     tr_dataset, ts_dataset = random_split(dataset, [0.80, 0.20])
+
     model = FINNModel(args.fingerprint_length, args.flow_length)
-    print(f"Number of parameters:")
-    print(f"\tTotal: {round(count_parameters(model) / 1e6, 2)}M")
-    print(f"\tEncoder: {round(count_parameters(model.encoder) / 1e6, 2)}M")
-    print(f"\tDecoder: {round(count_parameters(model.decoder) / 1e6, 2)}M")
+    p_t, p_e, p_d = count_parameters(model), count_parameters(model.encoder), count_parameters(model.decoder)
+    p_t, p_e, p_d = round(p_t / 1e6, 2), round(p_e / 1e6, 2), round(p_d / 1e6, 2)
+    print(f"Model:\n{model}")
+    print(f"Parameters: {p_t}M\n\tEncoder: {p_e}M\n\tDecoder: {p_d}M")
+
     training_args = FINNTrainerArgs(
         num_train_epochs=args.num_train_epochs,
         batch_size=args.batch_size,
