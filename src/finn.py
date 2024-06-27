@@ -15,6 +15,7 @@ NOTE
 
 from __future__ import annotations
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
 import os
@@ -37,6 +38,7 @@ from tqdm import tqdm
 if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from src.data import stream_synthetic_data
 from src.caida import stream_caida_data
 from src.utils import count_parameters, one_hot_to_binary
 
@@ -334,6 +336,8 @@ class FINNTrainerArgs:
     batch_size: int = 1
     dataloader_num_workers: int = 0
     device: torch.cuda.device = torch.device("cpu")
+    disable_tqdm: bool = False
+    logging_steps: int = -1
 
 
 class FINNTrainer:
@@ -370,12 +374,18 @@ class FINNTrainer:
             d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
             print(d)
 
+    def _get_pbar(self, iterable: Iterable, **kwds) -> tqdm | Iterable:
+        if self.args.disable_tqdm:
+            return iterable
+        return tqdm(iterable, **kwds)
+
     def train(self) -> float:
         self.model.train()
+        _cum_loss, _n_samples = 0, 0
         cum_loss, n_samples = 0, 0
         dataloader = self.get_dataloader(self.tr_dataset, shuffle=True)
-        pbar = tqdm(dataloader, total=len(self.tr_dataset) // self.args.batch_size)
-        for batch in pbar:
+        pbar = self._get_pbar(dataloader, total=len(self.tr_dataset) // self.args.batch_size)
+        for i, batch in enumerate(pbar):
 
             fingerprint: Tensor = batch[0].to(self.args.device)
             ipd: Tensor = batch[1].to(self.args.device)
@@ -388,8 +398,14 @@ class FINNTrainer:
             loss.backward()
             self.optimizer.step()
 
+            _cum_loss += loss.item()
+            _n_samples += fingerprint.size(0)
             cum_loss += loss.item()
             n_samples += fingerprint.size(0)
+
+            if i % self.args.logging_steps == 0:
+                print({"tr_loss": _cum_loss / _n_samples})
+                _cum_loss, _n_samples = 0, 0
 
         return cum_loss / n_samples
 
@@ -397,7 +413,7 @@ class FINNTrainer:
         self.model.eval()
         cum_loss, bit_errors, y_true, y_pred = 0, 0, [], []
         dataloader = self.get_dataloader(self.vl_dataset, shuffle=False)
-        pbar = tqdm(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
+        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
         for batch in pbar:
 
             fingerprint: Tensor = batch[0].to(self.args.device)
@@ -442,7 +458,9 @@ def main():
 
     parser = ArgumentParser(formatter_class=type("F", (ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter), {}))
     parser.add_argument("--fingerprint_length", type=int, default=512, help="ℓ")  # {512, 1024, 2048, 4096, 8192, 16384}
-    parser.add_argument("--flow_length", type=int, default=50, help="N")  # {50, 100, 150}
+    parser.add_argument("--flow_length", type=int, default=150, help="N")  # {50, 100, 150}
+    parser.add_argument("--min_flow_length", type=int, default=150, help=".")
+    parser.add_argument("--max_flow_length", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--amplitude", type=int, default=40, help="α")  # {5, 10, 20, 30, 40}
     parser.add_argument("--noise_deviation_low", type=float, default=2 / 1e3, help="σ")  # {(2, 10), (10, 20), (20, 30)}
     parser.add_argument("--noise_deviation_high", type=float, default=10 / 1e3, help="σ")  # σ {(2, 10), (10, 20), (20, 30)}
@@ -454,6 +472,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help=".")
     parser.add_argument("--disable_noise", action="store_true", help=".")
     parser.add_argument("--disable_delay", action="store_true", help=".")
+    parser.add_argument("--disable_tqdm", action="store_true", help=".")
+    parser.add_argument("--logging_steps", type=int, default=-1, help=".")
     args = parser.parse_args()
 
     pprint(args.__dict__)
@@ -464,7 +484,12 @@ def main():
 
     seed_everything(args.seed)
 
-    ipds = [np.array(sample.ipds) for sample in islice(stream_caida_data(), args.num_samples)]
+    ipds = (np.array(sample.ipds) for sample in stream_caida_data())
+    # ipds = stream_synthetic_data()
+
+    ipds = filter(lambda x: args.min_flow_length <= len(x) <= args.max_flow_length, ipds)
+    ipds = list(tqdm(islice(ipds, args.num_samples), total=args.num_samples, desc="Loading IPDs..."))
+
     dataset = FINNDataset(
         ipds,
         args.fingerprint_length,
@@ -485,6 +510,8 @@ def main():
         batch_size=args.batch_size,
         dataloader_num_workers=args.dataloader_num_workers,
         device=args.device,
+        disable_tqdm=args.disable_tqdm,
+        logging_steps=args.logging_steps,
     )
     collate_fn = FINNCollateFn(args.fingerprint_length, args.flow_length, "max", truncate=True)
     trainer = FINNTrainer(training_args, model, tr_dataset, ts_dataset, collate_fn)

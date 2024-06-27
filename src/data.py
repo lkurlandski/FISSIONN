@@ -1,6 +1,10 @@
+"""
+
+"""
 
 import pickle
 import numpy as np
+from typing import Generator
 
 
 def process(x: tuple) -> np.ndarray:
@@ -13,7 +17,7 @@ def process(x: tuple) -> np.ndarray:
     return iats
 
 
-def load_data(file: str = './processed.pkl') -> list[list[np.ndarray]]:
+def load_data(file: str = "/home/lk3591/Documents/code/TrafficAnal/data/synthetic.pickle") -> list[list[np.ndarray]]:
     """
     Load the metadata for all samples collected in our SSID data, and process them using the process() function.
 
@@ -58,12 +62,8 @@ def load_data(file: str = './processed.pkl') -> list[list[np.ndarray]]:
     return all_streams
 
 
-def load_ipds() -> list[list[float]]:
-    all_streams = load_data()
-    ipds: list[tuple[float]] = []
+def stream_synthetic_data() -> Generator[np.ndarray, None, None]:
+    all_streams: list[list[np.ndarray]] = load_data()
     for group in all_streams:
         for stream in group:
-            ipds.append(tuple(stream))
-    ipds: list[tuple[float]] = list(set(ipds))
-    ipds = [list(ipd) for ipd in ipds]
-    return ipds
+            yield stream
