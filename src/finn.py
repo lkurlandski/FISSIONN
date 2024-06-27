@@ -29,8 +29,8 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import torch
 from torch import nn, Tensor, tensor
 from torch.distributions import Laplace, Uniform, Normal
-from torch.nn import functional as F
-from torch.optim import Adam
+from torch.nn import functional as F, CrossEntropyLoss, L1Loss
+from torch.optim import Optimizer, Adam
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
@@ -43,6 +43,7 @@ from src.caida import stream_caida_data
 from src.utils import count_parameters, one_hot_to_binary
 
 
+DISABLE_IPDS: Optional[bool] = None
 DISABLE_NOISE: Optional[bool] = None
 DISABLE_DELAY: Optional[bool] = None
 
@@ -102,8 +103,9 @@ class FINNDataset(Dataset):
         delay = self.sampler_delay.sample((len(ipd),)).abs()
         noise = self.noise_sampler.sample((len(ipd),)).abs()
 
-        delay = delay if not DISABLE_DELAY else torch.zeros((len(ipd),))
-        noise = noise if not DISABLE_NOISE else torch.zeros((len(ipd),))
+        ipd = ipd if not DISABLE_IPDS else torch.ones((len(ipd),))
+        delay = delay if not DISABLE_DELAY else torch.ones((len(ipd),))
+        noise = noise if not DISABLE_NOISE else torch.ones((len(ipd),))
 
         return fingerprint, ipd, delay, noise
 
@@ -167,7 +169,9 @@ class FINNLoss(nn.Module):
         """
         super().__init__()
         self.encoder_weight = encoder_weight
+        self.encoder_loss_fn = L1Loss()
         self.decoder_weight = decoder_weight
+        self.decoder_loss_fn = CrossEntropyLoss()
 
     def forward(
         self,
@@ -175,7 +179,7 @@ class FINNLoss(nn.Module):
         encoder_labels: Tensor,
         decoder_logits: Tensor,
         decoder_labels: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """
         Args:
             encoder_logits (Tensor): Predicted timing delays from the encoder.
@@ -184,17 +188,18 @@ class FINNLoss(nn.Module):
             decoder_labels (Tensor): One-hot or categorical labels indicating the true fingerprint.
 
         Returns:
-            Tensor: Cumulative loss of the encoder and decoder.
+            Tensor: Cumulative loss of the encoder and decoder, the encoder loss, and the decoder loss.
         """
-        encoder_loss = F.l1_loss(encoder_logits, encoder_labels)
-        decoder_loss = F.cross_entropy(decoder_logits, decoder_labels)
-        return self.encoder_weight * encoder_loss + self.decoder_weight * decoder_loss
+        encoder_loss = self.get_encoder_loss(encoder_logits, encoder_labels)
+        decoder_loss = self.get_decoder_loss(decoder_logits, decoder_labels)
+        weighted_loss = encoder_loss + decoder_loss
+        return weighted_loss, encoder_loss, decoder_loss
 
+    def get_encoder_loss(self, encoder_logits: Tensor, encoder_labels: Tensor) -> Tensor:
+        return self.encoder_weight * self.encoder_loss_fn(encoder_logits, encoder_labels)
 
-@dataclass
-class FINNModelOutput:
-    delay: Tensor
-    fingerprint: Tensor
+    def get_decoder_loss(self, decoder_logits: Tensor, decoder_labels: Tensor) -> Tensor:
+        return self.decoder_weight * self.decoder_loss_fn(decoder_logits, decoder_labels)  # argmax?
 
 
 class FINNEncoder(nn.Module):
@@ -297,14 +302,15 @@ class FINNModel(nn.Module):
         self.encoder = FINNEncoder(fingerprint_length + flow_length, flow_length)
         self.decoder = FINNDecoder(flow_length, fingerprint_length)
 
-    def forward(self, fingerprint: Tensor, ipd: Tensor, noise: Tensor) -> FINNModelOutput:
+    def forward(self, fingerprint: Tensor, ipd: Tensor, noise: Tensor) -> tuple[Tensor, Tensor]:
         """
         Args:
           fingerprint: Tensor - The fingerprint tensor.
           ipd: Tensor - The inter-packet delays tensor.
           noise: Tensor - The noise tensor.
         Returns:
-          FINNModelOutput - The output of the model.
+          Tensor - The predicted fingerprint delay.
+          Tensor - The predicted fingerprint.
         """
         if fingerprint.dim() != 2 or fingerprint.shape[1] != self.fingerprint_length:
             raise ShapeError(fingerprint.shape, ("*", self.fingerprint_length))
@@ -314,20 +320,20 @@ class FINNModel(nn.Module):
             raise ShapeError(noise.shape, ("*", self.flow_length))
 
         fingerprint_and_noise = torch.cat((fingerprint, noise), dim=1)
-        delay: Tensor = self.encoder(fingerprint_and_noise)
-        noisy_marked_ipd = self.combine_3(ipd, delay, noise)
-        fingerprint = self.decoder(noisy_marked_ipd)
+        delay_pred = self.encoder.forward(fingerprint_and_noise)
+        noisy_marked_ipd = self.combine_3(ipd, delay_pred, noise)
+        fingerprint_pred = self.decoder(noisy_marked_ipd)
 
-        return FINNModelOutput(delay, fingerprint)
+        return delay_pred, fingerprint_pred
 
     def combine_1(self, ipd: Tensor, delay: Tensor, noise: Tensor) -> Tensor:
         return ipd + delay + noise
 
     def combine_2(self, ipd: Tensor, delay: Tensor, noise: Tensor) -> Tensor:
-        return ipd + torch.cumsum(delay, dim=0) + noise
+        return ipd + torch.cumsum(delay, dim=1) + noise
 
     def combine_3(self, ipd: Tensor, delay: Tensor, noise: Tensor) -> Tensor:
-        return ipd + torch.cumsum(delay, dim=0) + torch.cumsum(noise, dim=0)
+        return ipd + torch.cumsum(delay, dim=1) + torch.cumsum(noise, dim=1)
 
 
 @dataclass
@@ -349,6 +355,8 @@ class FINNTrainer:
         tr_dataset: FINNDataset,
         vl_dataset: FINNDataset,
         collate_fn: FINNCollateFn,
+        loss_fn: FINNLoss,
+        optimizer: Optimizer,
     ) -> None:
         self.args = args
         self.model = model
@@ -356,21 +364,21 @@ class FINNTrainer:
         self.tr_dataset = tr_dataset
         self.vl_dataset = vl_dataset
         self.collate_fn = collate_fn
-
-        self.optimizer = Adam(self.model.parameters(), lr=0.001)
-        self.loss_fn = FINNLoss(encoder_weight=1.0, decoder_weight=5.0)
+        self.loss_fn = loss_fn
+        self.optimizer = optimizer
 
     def __call__(self) -> None:
 
-        vl_loss, metrics = self.evaluate()
-        d = {"epoch": 0, "tr_loss": float("nan"), "vl_loss": vl_loss} | metrics
+        vl_metrics = self.evaluate()
+        d = {"epoch": 0} | vl_metrics
         d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
         print(d)
 
-        for epoch in tqdm(range(1, self.args.num_train_epochs + 1), desc="Epochs"):
-            tr_loss = self.train()
-            vl_loss, metrics = self.evaluate()
-            d = {"epoch": epoch, "tr_loss": tr_loss, "vl_loss": vl_loss} | metrics
+        pbar = self._get_pbar(range(1, self.args.num_train_epochs + 1), desc="Epochs")
+        for epoch in pbar:
+            tr_metrics = self.train()
+            vl_metrics = self.evaluate()
+            d = {"epoch": epoch} | tr_metrics | vl_metrics
             d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
             print(d)
 
@@ -379,10 +387,10 @@ class FINNTrainer:
             return iterable
         return tqdm(iterable, **kwds)
 
-    def train(self) -> float:
+    def train(self) -> dict[str, float]:
         self.model.train()
-        _cum_loss, _n_samples = 0, 0
-        cum_loss, n_samples = 0, 0
+        cum_samples, cum_weighted_loss, cum_encoder_loss, cum_decoder_loss = 0, 0, 0, 0
+        log_samples, log_weighted_loss, log_encoder_loss, log_decoder_loss = 0, 0, 0, 0
         dataloader = self.get_dataloader(self.tr_dataset, shuffle=True)
         pbar = self._get_pbar(dataloader, total=len(self.tr_dataset) // self.args.batch_size)
         for i, batch in enumerate(pbar):
@@ -393,25 +401,43 @@ class FINNTrainer:
             noise: Tensor = batch[3].to(self.args.device)
 
             self.model.zero_grad()
-            output = self.model.forward(fingerprint, ipd, noise)
-            loss: Tensor = self.loss_fn.forward(output.delay, delay, output.fingerprint, fingerprint)
-            loss.backward()
+            delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
+            weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
+            weighted_loss.backward()
             self.optimizer.step()
 
-            _cum_loss += loss.item()
-            _n_samples += fingerprint.size(0)
-            cum_loss += loss.item()
-            n_samples += fingerprint.size(0)
+            cum_samples += fingerprint.size(0)
+            cum_weighted_loss += weighted_loss.item()
+            cum_encoder_loss += encoder_loss.item()
+            cum_decoder_loss += decoder_loss.item()
+
+            log_samples += fingerprint.size(0)
+            log_weighted_loss += weighted_loss.item()
+            log_encoder_loss += encoder_loss.item()
+            log_decoder_loss += decoder_loss.item()
 
             if i % self.args.logging_steps == 0:
-                print({"tr_loss": _cum_loss / _n_samples})
-                _cum_loss, _n_samples = 0, 0
+                d = {
+                    "log_weighted_loss": log_weighted_loss / log_samples,
+                    "log_encoder_loss": log_encoder_loss / log_samples,
+                    "log_decoder_loss": log_decoder_loss / log_samples,
+                }
+                d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
+                log_samples, log_weighted_loss, log_encoder_loss, log_decoder_loss = 0, 0, 0, 0
+                print(d)
 
-        return cum_loss / n_samples
+        d = {
+            "tr_weighted_loss": cum_weighted_loss / cum_samples,
+            "tr_encoder_loss": cum_encoder_loss / cum_samples,
+            "tr_decoder_loss": cum_decoder_loss / cum_samples,
+        }
 
-    def evaluate(self) -> tuple[float, dict[str, float]]:
+        return d
+
+    def evaluate(self) -> dict[str, float]:
         self.model.eval()
-        cum_loss, bit_errors, y_true, y_pred = 0, 0, [], []
+        cum_samples, cum_weighted_loss, cum_encoder_loss, cum_decoder_loss = 0, 0, 0, 0
+        bit_errors, y_true, y_pred = 0, [], []
         dataloader = self.get_dataloader(self.vl_dataset, shuffle=False)
         pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
         for batch in pbar:
@@ -421,9 +447,9 @@ class FINNTrainer:
             delay: Tensor = batch[2].to(self.args.device)
             noise: Tensor = batch[3].to(self.args.device)
 
-            output = self.model.forward(fingerprint, ipd, noise)
-            loss: Tensor = self.loss_fn.forward(output.delay, delay, output.fingerprint, fingerprint)
-            predictions = F.softmax(output.fingerprint, dim=-1)
+            delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
+            weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
+            predictions = F.softmax(fingerprint_pred, dim=-1)
 
             one_hot_predictions = torch.zeros_like(predictions)
             one_hot_predictions[torch.arange(len(predictions)), torch.argmax(predictions, dim=1)] = 1
@@ -432,17 +458,23 @@ class FINNTrainer:
             bit_difference = binary_fingerprint ^ binary_predictions
             bit_errors += bit_difference.sum().item()
     
-            cum_loss += loss.item()
+            cum_samples += fingerprint.size(0)
+            cum_weighted_loss += weighted_loss.item()
+            cum_encoder_loss += encoder_loss.item()
+            cum_decoder_loss += decoder_loss.item()
 
             y_true.extend(torch.argmax(fingerprint, dim=1).tolist())
             y_pred.extend(torch.argmax(predictions, dim=1).tolist())
 
-        metrics = {
+        d = {
+            "vl_weighted_loss": cum_weighted_loss / cum_samples,
+            "vl_encoder_loss": cum_encoder_loss / cum_samples,
+            "vl_decoder_loss": cum_decoder_loss / cum_samples,
+            "bit_error_rate": bit_errors / cum_samples,
             "extraction_rate": accuracy_score(y_true, y_pred),
-            "bit_error_rate": bit_errors / len(y_pred),
         }
 
-        return cum_loss / len(y_pred), metrics
+        return d
 
     def get_dataloader(self, dataset: FINNDataset, shuffle: bool = False) -> None:
         return DataLoader(
@@ -461,15 +493,19 @@ def main():
     parser.add_argument("--flow_length", type=int, default=150, help="N")  # {50, 100, 150}
     parser.add_argument("--min_flow_length", type=int, default=150, help=".")
     parser.add_argument("--max_flow_length", type=int, default=sys.maxsize, help=".")
-    parser.add_argument("--amplitude", type=int, default=40, help="α")  # {5, 10, 20, 30, 40}
+    parser.add_argument("--amplitude", type=int, default=40 / 1e3, help="α")  # {5, 10, 20, 30, 40}
     parser.add_argument("--noise_deviation_low", type=float, default=2 / 1e3, help="σ")  # {(2, 10), (10, 20), (20, 30)}
     parser.add_argument("--noise_deviation_high", type=float, default=10 / 1e3, help="σ")  # σ {(2, 10), (10, 20), (20, 30)}
+    parser.add_argument("--encoder_loss_weight", type=float, default=1.0, help=".")
+    parser.add_argument("--decoder_loss_weight", type=float, default=5.0, help=".")
     parser.add_argument("--num_train_epochs", type=int, default=1, help=".")  # {100, 150 200}
     parser.add_argument("--num_samples", type=int, default=sys.maxsize, help=".")  # {200000, 500000}
     parser.add_argument("--batch_size", type=int, default=2, help=".")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help=".")
     parser.add_argument("--dataloader_num_workers", type=int, default=0, help=".")
     parser.add_argument("--device", type=torch.device, default="cpu", help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
+    parser.add_argument("--disable_ipds", action="store_true", help=".")
     parser.add_argument("--disable_noise", action="store_true", help=".")
     parser.add_argument("--disable_delay", action="store_true", help=".")
     parser.add_argument("--disable_tqdm", action="store_true", help=".")
@@ -478,14 +514,15 @@ def main():
 
     pprint(args.__dict__)
 
-    global DISABLE_NOISE, DISABLE_DELAY
+    global DISABLE_IPDS, DISABLE_NOISE, DISABLE_DELAY
+    DISABLE_IPDS = args.disable_ipds
     DISABLE_NOISE = args.disable_noise
     DISABLE_DELAY = args.disable_delay
 
     seed_everything(args.seed)
 
-    ipds = (np.array(sample.ipds) for sample in stream_caida_data())
-    # ipds = stream_synthetic_data()
+    ipds = (np.array(sample.ipds, dtype=np.int32) for sample in stream_caida_data())
+    # ipds = (np.array(ipd, dtype=np.int32) for ipd in stream_synthetic_data())
 
     ipds = filter(lambda x: args.min_flow_length <= len(x) <= args.max_flow_length, ipds)
     ipds = list(tqdm(islice(ipds, args.num_samples), total=args.num_samples, desc="Loading IPDs..."))
@@ -514,7 +551,9 @@ def main():
         logging_steps=args.logging_steps,
     )
     collate_fn = FINNCollateFn(args.fingerprint_length, args.flow_length, "max", truncate=True)
-    trainer = FINNTrainer(training_args, model, tr_dataset, ts_dataset, collate_fn)
+    loss_fn = FINNLoss(encoder_weight=args.encoder_loss_weight, decoder_weight=args.decoder_loss_weight)
+    optimizer = Adam(model.parameters(), lr=args.learning_rate)
+    trainer = FINNTrainer(training_args, model, tr_dataset, ts_dataset, collate_fn, loss_fn, optimizer)
 
     trainer()
 
