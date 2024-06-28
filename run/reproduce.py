@@ -8,6 +8,7 @@ import sys
 
 parser = ArgumentParser()
 parser.add_argument("--device", type=str, default="0", help="CUDA_VISIBLE_DEVICES={device}")
+parser.add_argument("--demo", action="store_true", help="Run demo experiments")
 args = parser.parse_args()
 
 
@@ -45,8 +46,9 @@ def get_body(
     --batch_size=1024 \\
     --learning_rate=1e-4 \\
     --dataloader_num_workers=4 \\
+    {'--demo \\' if args.demo else 'REMOVE'}
     --device=cuda:{args.device} > {logfile} 2>&1
-    """.replace("    ", "")
+    """.replace("    ", "").replace("REMOVE\n", "")
 
 
 runfiles = []
