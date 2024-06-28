@@ -20,6 +20,7 @@ def get_body(
     noise_deviation_low: float,
     noise_deviation_high: float,
     tr_num_samples: int,
+    vl_num_samples: int,
     num_train_epochs: int,
     outfile: str,
     logfile: str,
@@ -42,7 +43,7 @@ def get_body(
     --encoder_loss_weight=1.0 \\
     --decoder_loss_weight=5.0 \\
     --tr_num_samples={tr_num_samples} \\
-    --vl_num_samples=50000 \\
+    --vl_num_samples={vl_num_samples} \\
     --seed=0 \\
     --outfile={outfile} \\
     --num_train_epochs={num_train_epochs} \\
@@ -72,6 +73,7 @@ for tr_num_samples in (200000, 500000):
             noise_deviation_low=2e-3,
             noise_deviation_high=10e-3,
             tr_num_samples=tr_num_samples,
+            vl_num_samples=50000,
             num_train_epochs=100,
             outfile=outfile,
             logfile=logfile,
@@ -96,6 +98,7 @@ for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3),
             noise_deviation_low=noise_deviation_low,
             noise_deviation_high=noise_deviation_high,
             tr_num_samples=200000,
+            vl_num_samples=50000,
             num_train_epochs=100,
             outfile=outfile,
             logfile=logfile,
@@ -121,6 +124,7 @@ for tr_num_samples in (200000, 500000):
                 noise_deviation_low=2,
                 noise_deviation_high=10,
                 tr_num_samples=tr_num_samples,
+                vl_num_samples=50000,
                 num_train_epochs=num_train_epochs,
                 outfile=outfile,
                 logfile=logfile,
@@ -129,6 +133,30 @@ for tr_num_samples in (200000, 500000):
                 f.write(body + "\n")
             runfiles.append(runfile)
 
+
+# Test the largest configuration.
+
+jobname = f"test"
+logfile = f"./logs/{jobname}.log"
+outfile = f"./output/{jobname}.jsonl"
+runfile = f"./run/{jobname}.sh"
+body = get_body(
+    fingerprint_length=16384,
+    flow_length=150,
+    amplitude=5e-3,
+    noise_deviation_low=2,
+    noise_deviation_high=10,
+    tr_num_samples=100000,
+    vl_num_samples=10000,
+    num_train_epochs=1,
+    outfile=outfile,
+    logfile=logfile,
+)
+with open(runfile, "w") as f:
+    f.write(body + "\n")
+
+
+# Convienient run script.
 
 with open("./run/run.sh", "w") as f:
     f.write("\n".join([f"CUDA_VISIBLE_DEVICES={args.device} bash {runfile}" for runfile in runfiles]) + "\n")
