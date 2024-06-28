@@ -170,3 +170,4 @@ logs/*
 notebooks/*
 output/*
 run/*.sh
+*tmp*
