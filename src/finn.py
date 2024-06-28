@@ -647,9 +647,9 @@ def main():
 
     model = FINNModel(args.fingerprint_length, args.flow_length)
     print(f"Model:\n{model}")
-    print(f"Total Parameters: {round(count_parameters(model), 2)}M")
-    print(f"Encoder Parameters: {round(count_parameters(model.encoder), 2)}M")
-    print(f"Decoder Parameters: {round(count_parameters(model.decoder), 2)}M")
+    print(f"Total Parameters: {round(count_parameters(model) / 1e6, 2)}M")
+    print(f"Encoder Parameters: {round(count_parameters(model.encoder) / 1e6, 2)}M")
+    print(f"Decoder Parameters: {round(count_parameters(model.decoder) / 1e6, 2)}M")
     print("-" * 80)
 
     training_arguments = FINNTrainerArgs(
