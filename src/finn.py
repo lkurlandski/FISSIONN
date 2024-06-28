@@ -16,8 +16,10 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, MetavarTypeH
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
+import json
 import os
-from pprint import pprint
+from pathlib import Path
+from pprint import pformat, pprint
 import random
 import sys
 from typing import Literal, Optional
@@ -40,11 +42,6 @@ if __name__ == "__main__":
 
 from src.caida import stream_caida_data
 from src.utils import count_parameters, one_hot_to_binary
-
-
-DISABLE_IPDS: Optional[bool] = None
-DISABLE_NOISE: Optional[bool] = None
-DISABLE_DELAY: Optional[bool] = None
 
 
 class ShapeError(ValueError):
@@ -103,11 +100,6 @@ class FINNDataset(Dataset):
         fingerprint = torch.eye(self.fingerprint_length)[torch.randint(self.fingerprint_length, (1,))].squeeze(0)
         delay = self.sampler_delay.sample((len(ipd),)).abs()
         noise = self.noise_sampler.sample((len(ipd),)).abs()
-
-        ipd = ipd if not DISABLE_IPDS else torch.ones((len(ipd),))
-        delay = delay if not DISABLE_DELAY else torch.ones((len(ipd),))
-        noise = noise if not DISABLE_NOISE else torch.ones((len(ipd),))
-
         return fingerprint, ipd, delay, noise
 
 
@@ -346,6 +338,7 @@ class FINNModel(nn.Module):
 
 @dataclass
 class FINNTrainerArgs:
+    outfile: Path
     num_train_epochs: int = 1
     batch_size: int = 1
     dataloader_num_workers: int = 0
@@ -374,26 +367,36 @@ class FINNTrainer:
         self.collate_fn = collate_fn
         self.loss_fn = loss_fn
         self.optimizer = optimizer
+        self.log = []
 
     def __call__(self) -> None:
+        if self.args.outfile.exists():
+            raise FileExistsError(f"Logfile already exists: {self.args.outfile}")
+        self.args.outfile.parent.mkdir(parents=True, exist_ok=True)
 
+        tr_metrics = {"tr_weighted_loss": float("nan"), "tr_encoder_loss": float("nan"), "tr_decoder_loss": float("nan")}
         vl_metrics = self.evaluate()
-        d = {"epoch": 0} | vl_metrics
-        d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
-        print(d)
+        d = {"epoch": 0} | tr_metrics | vl_metrics
+        self.log.append(d)
+        print(self._fmt_dict(d))
 
         pbar = self._get_pbar(range(1, self.args.num_train_epochs + 1), desc="Epochs")
         for epoch in pbar:
             tr_metrics = self.train()
             vl_metrics = self.evaluate()
             d = {"epoch": epoch} | tr_metrics | vl_metrics
-            d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
-            print(d)
+            self.log.append(d)
+            print(self._fmt_dict(d))
+            with open(self.args.outfile, "a") as fp:
+                fp.write(json.dumps(d) + "\n")
 
     def _get_pbar(self, iterable: Iterable, **kwds) -> tqdm | Iterable:
         if self.args.disable_tqdm:
             return iterable
         return tqdm(iterable, **kwds)
+
+    def _fmt_dict(self, d: dict[str, float]) -> dict[str, str]:
+        return {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
 
     def train(self) -> dict[str, float]:
         self.model.train()
@@ -424,7 +427,7 @@ class FINNTrainer:
             log_encoder_loss += encoder_loss.item()
             log_decoder_loss += decoder_loss.item()
 
-            if i % self.args.logging_steps == 0:
+            if self.args.logging_steps > 0 and i % self.args.logging_steps == 0:
                 d = {
                     "log_weighted_loss": log_weighted_loss / log_samples,
                     "log_encoder_loss": log_encoder_loss / log_samples,
@@ -497,60 +500,76 @@ class FINNTrainer:
 def main():
 
     parser = ArgumentParser(formatter_class=type("F", (ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter), {}))
-    parser.add_argument("--fingerprint_length", type=int, default=512, help="ℓ")  # {512, 1024, 2048, 4096, 8192, 16384}
-    parser.add_argument("--flow_length", type=int, default=150, help="N")  # {50, 100, 150}
+    parser.add_argument("--fingerprint_length", type=int, default=512, help=".")
+    parser.add_argument("--flow_length", type=int, default=150, help=".")
     parser.add_argument("--min_flow_length", type=int, default=150, help=".")
     parser.add_argument("--max_flow_length", type=int, default=sys.maxsize, help=".")
-    parser.add_argument("--amplitude", type=int, default=40 / 1e3, help="α")  # {5, 10, 20, 30, 40}
-    parser.add_argument("--noise_deviation_low", type=float, default=2 / 1e3, help="σ")  # {(2, 10), (10, 20), (20, 30)}
-    parser.add_argument("--noise_deviation_high", type=float, default=10 / 1e3, help="σ")  # σ {(2, 10), (10, 20), (20, 30)}
+    parser.add_argument("--amplitude", type=float, default=40 / 1e3, help=".")
+    parser.add_argument("--noise_deviation_low", type=float, default=2 / 1e3, help=".")
+    parser.add_argument("--noise_deviation_high", type=float, default=10 / 1e3, help=".")
     parser.add_argument("--encoder_loss_weight", type=float, default=1.0, help=".")
     parser.add_argument("--decoder_loss_weight", type=float, default=5.0, help=".")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help=".")  # {100, 150 200}
-    parser.add_argument("--num_samples", type=int, default=sys.maxsize, help=".")  # {200000, 500000}
+    parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
+    parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
+    parser.add_argument("--seed", type=int, default=0, help=".")
+    parser.add_argument("--outfile", type=Path, default=Path("./output/tmp.jsonl"), help=".")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help=".")
     parser.add_argument("--batch_size", type=int, default=2, help=".")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help=".")
     parser.add_argument("--dataloader_num_workers", type=int, default=0, help=".")
     parser.add_argument("--device", type=torch.device, default="cpu", help=".")
-    parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--disable_ipds", action="store_true", help=".")
-    parser.add_argument("--disable_noise", action="store_true", help=".")
-    parser.add_argument("--disable_delay", action="store_true", help=".")
     parser.add_argument("--disable_tqdm", action="store_true", help=".")
     parser.add_argument("--logging_steps", type=int, default=-1, help=".")
     args = parser.parse_args()
 
-    pprint(args.__dict__)
-
-    global DISABLE_IPDS, DISABLE_NOISE, DISABLE_DELAY
-    DISABLE_IPDS = args.disable_ipds
-    DISABLE_NOISE = args.disable_noise
-    DISABLE_DELAY = args.disable_delay
+    print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
+    print("-" * 80)
 
     seed_everything(args.seed)
 
-    ipds = (np.array(sample.ipds, dtype=np.int32) for sample in stream_caida_data())
-    # ipds = (np.array(ipd, dtype=np.int32) for ipd in stream_synthetic_data())
+    tr_stream = stream_caida_data(year="passive-2016", source="equinix-chicago")
+    vl_stream = stream_caida_data(year="passive-2018", source="equinix-nyc")
+    # FIXME:
+    # vl_stream = stream_caida_data(year="passive-2018", source="equinix-nyc")
+    vl_stream = stream_caida_data(year="passive-2016", source="equinix-chicago")
 
-    ipds = filter(lambda x: args.min_flow_length <= len(x) <= args.max_flow_length, ipds)
-    ipds = list(tqdm(islice(ipds, args.num_samples), total=args.num_samples, desc="Loading IPDs..."))
+    def get_ipds(stream: Iterable, num_samples: int):
+        ipds = (np.array(sample.ipds, dtype=np.int32) for sample in stream)
+        ipds = filter(lambda x: args.min_flow_length <= len(x) <= args.max_flow_length, ipds)
+        ipds = list(tqdm(islice(ipds, num_samples), total=num_samples, desc="Loading IPDs..."))
+        return ipds
 
-    dataset = FINNDataset(
-        ipds,
+    tr_ipds = get_ipds(tr_stream, args.tr_num_samples)
+    vl_ipds = get_ipds(vl_stream, args.vl_num_samples)
+
+    tr_dataset = FINNDataset(
+        tr_ipds,
         args.fingerprint_length,
         args.amplitude,
         args.noise_deviation_low,
         args.noise_deviation_high,
     )
-    tr_dataset, ts_dataset = random_split(dataset, [0.80, 0.20])
+    vl_dataset = FINNDataset(
+        vl_ipds,
+        args.fingerprint_length,
+        args.amplitude,
+        args.noise_deviation_low,
+        args.noise_deviation_high,
+    )
+
+    print(f"Training Dataset:\n{tr_dataset}")
+    print(f"Validation Dataset:\n{vl_dataset}")
+    print("-" * 80)
 
     model = FINNModel(args.fingerprint_length, args.flow_length)
-    p_t, p_e, p_d = count_parameters(model), count_parameters(model.encoder), count_parameters(model.decoder)
-    p_t, p_e, p_d = round(p_t / 1e6, 2), round(p_e / 1e6, 2), round(p_d / 1e6, 2)
     print(f"Model:\n{model}")
-    print(f"Parameters: {p_t}M\n\tEncoder: {p_e}M\n\tDecoder: {p_d}M")
+    print(f"Total Parameters: {round(count_parameters(model), 2)}M")
+    print(f"Encoder Parameters: {round(count_parameters(model.encoder), 2)}M")
+    print(f"Decoder Parameters: {round(count_parameters(model.decoder), 2)}M")
+    print("-" * 80)
 
-    training_args = FINNTrainerArgs(
+    training_arguments = FINNTrainerArgs(
+        outfile=args.outfile,
         num_train_epochs=args.num_train_epochs,
         batch_size=args.batch_size,
         dataloader_num_workers=args.dataloader_num_workers,
@@ -561,7 +580,7 @@ def main():
     collate_fn = FINNCollateFn(args.fingerprint_length, args.flow_length, "max", truncate=True)
     loss_fn = FINNLoss(encoder_weight=args.encoder_loss_weight, decoder_weight=args.decoder_loss_weight)
     optimizer = Adam(model.parameters(), lr=args.learning_rate)
-    trainer = FINNTrainer(training_args, model, tr_dataset, ts_dataset, collate_fn, loss_fn, optimizer)
+    trainer = FINNTrainer(training_arguments, model, tr_dataset, vl_dataset, collate_fn, loss_fn, optimizer)
 
     trainer()
 
