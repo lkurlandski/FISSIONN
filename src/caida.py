@@ -10,7 +10,9 @@ Next, decompress all the pcap files.
 from array import array
 from argparse import ArgumentParser
 from collections import defaultdict, namedtuple
+from collections.abc import Iterable
 import gzip
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -30,12 +32,13 @@ import pyshark
 from tqdm import tqdm
 
 
-CAIDA_ROOT_PATH = Path("/home/lk3591/Documents/datasets/CAIDA/data.caida.org/datasets/")
+DEFAULT_CAIDA_PATH = Path("/home/lk3591/Documents/datasets/CAIDA/")
+DEFAULT_DATA_PATH = Path("./data")
 VERBOSE = True
 
 
 def decompress(f: Path) -> Path:
-    temp_file = NamedTemporaryFile(delete=False)
+    temp_file = NamedTemporaryFile(delete=False)  # pylint: disable=consider-using-with
     with gzip.open(f, "rb") as f_in:
         with open(temp_file.name, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
@@ -113,24 +116,24 @@ def process_file(input_file: Path, output_file: Path) -> None:
         save_ipds(ipds, output_file)
         os.unlink(temp_file)
         print(f"Worker {os.getpid()} process {len(flows)} flows in {round(time.time() - t_0)} seconds from {'/'.join(input_file.parts[-4:])}")
-    except Exception as err:
+    except Exception as err:  # pylint: disable=broad-except
         print(f"Worker {os.getpid()} failed to process {input_file} because of {type(err)}.\n{err=}")
 
 
 def _json_to_pickle(f_json: Path, remove: bool) -> None:
-        print(f"Worker {os.getpid()} processing {str(f_json)}")
-        data = []
-        with open(f_json, "r") as fp:
-            for line in fp:
-                d = json.loads(line.strip())
-                d["ipds"] = array("f", d["ipds"])
-                data.append(d)
-        f_pickle = f_json.with_suffix(".pickle")
-        data = [CaidaSample(*d.values()) for d in data]
-        with open(f_pickle, "wb") as fp:
-            pickle.dump(data, fp)
-        if remove:
-            f_json.unlink()
+    print(f"Worker {os.getpid()} processing {str(f_json)}")
+    data = []
+    with open(f_json, "r") as fp:
+        for line in fp:
+            d = json.loads(line.strip())
+            d["ipds"] = array("f", d["ipds"])
+            data.append(d)
+    f_pickle = f_json.with_suffix(".pickle")
+    data = [CaidaSample(*d.values()) for d in data]
+    with open(f_pickle, "wb") as fp:
+        pickle.dump(data, fp)
+    if remove:
+        f_json.unlink()
 
 
 def json_to_pickle(
@@ -146,9 +149,7 @@ def json_to_pickle(
 
 
 def stream_caida_data(
-    output: Path = Path("./data"),
-    year: str = "passive-2016",
-    source: str = "equinix-chicago",
+    year: str, source: str, output: Path = DEFAULT_DATA_PATH,
 ) -> Generator[CaidaSample, None, None]:
     output_root = output / year / source
     for f in output_root.rglob("*.pickle"):
@@ -158,16 +159,42 @@ def stream_caida_data(
             yield sample
 
 
+def stream_caida_data_demo(
+    year: str, source: str, output: Path = DEFAULT_DATA_PATH,
+) -> Generator[CaidaSample, None, None]:
+    f = output / f"demo_{year}_{source}.pickle"
+    with open(f, "rb") as fp:
+        data = pickle.load(fp)
+    for ipds in data:
+        yield CaidaSample(None, None, None, None, None, ipds)
+
+
+def get_caida_ipds(
+    stream: Iterable[CaidaSample],
+    min_flow_length: int = -1,
+    max_flow_length: int = sys.maxsize,
+    num_samples: int = sys.maxsize,
+    disable_tqdm: bool = False,
+) -> list[np.ndarray]:
+    ipds = (np.array(sample.ipds, dtype=np.int32) for sample in stream)
+    ipds = filter(lambda x: min_flow_length <= len(x) <= max_flow_length, ipds)
+    ipds = islice(ipds, num_samples)
+    if not disable_tqdm:
+        ipds = tqdm(ipds, total=num_samples, desc="Loading IPDs...")
+    return list(ipds)
+
+
 def main() -> None:
 
     parser = ArgumentParser()
-    parser.add_argument("--year", type=str, default="passive-2016")
-    parser.add_argument("--source", type=str, default="equinix-chicago")
-    parser.add_argument("--output", type=Path, default=Path("./data"))
+    parser.add_argument("--root", type=Path, help="/PATH/TO/CAIDA", default=DEFAULT_CAIDA_PATH)
+    parser.add_argument("--year", type=str, help="`passive-2016`, `passive-2018` etc.")
+    parser.add_argument("--source", type=str, help="`equinix-chicago`, `equinix-nyc` etc.")
+    parser.add_argument("--output", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--num_workers", type=int, default=1)
     args = parser.parse_args()
 
-    input_root: Path = CAIDA_ROOT_PATH / args.year / args.source
+    input_root: Path = args.root / "data.caida.org/datasets/" / args.year / args.source
     output_root = args.output / args.year / args.source
     input_files = list(input_root.rglob("*.pcap.gz"))
     output_files = [output_root / f"{f.stem}.pickle" for f in input_files]
