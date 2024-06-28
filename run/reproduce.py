@@ -3,6 +3,7 @@ Creates bash files to run synthetic experiments.
 """
 
 from argparse import ArgumentParser
+from pathlib import Path
 import sys
 
 
@@ -27,6 +28,8 @@ def get_body(
 
     source ~/anaconda3/etc/profile.d/conda.sh
     conda activate TrafficAnal
+
+    echo "Running {Path(outfile).stem}..."
 
     python -u src/finn.py \\
     --fingerprint_length={fingerprint_length} \\
