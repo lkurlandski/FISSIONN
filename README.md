@@ -9,18 +9,7 @@
 ```bash
 sudo apt install wireshark
 
-conda create -n TrafficAnal \
-python=3.12 \
-pytorch=2.3.0 \
-torchvision=0.18.0 \
-torchaudio=2.3.0 \
-torchtext=0.18.0 \
-pytorch-cuda=12.1 \
-scikit-learn \
-scipy \
-pandas \
-scikit-learn \
--c pytorch -c nvidia -c conda-forge
+conda create -n TrafficAnal python=3.12 pytorch=2.3.0 torchvision=0.18.0 torchaudio=2.3.0 torchtext=0.18.0 pytorch-cuda=12.1 scikit-learn scipy pandas scikit-learn -c pytorch -c nvidia -c conda-forge
 
 conda activate TrafficAnal
 
@@ -32,8 +21,8 @@ pip install pyshark
 To get access to the CAIDA dataset, follow the instructions from [CAIDA](https://www.caida.org/catalog/datasets/passive_dataset/). After creating a USERNAME and PASSWORD, you can download the data using wget.
 
 ```bash
-wget --recursive --level=16 --no-parent --user=USERNAME --pasword=PASSWORD "https://data/caida/org/datasets/passive-2016/"
-wget --recursive --level=16 --no-parent --user=USERNAME --pasword=PASSWORD "https://data/caida/org/datasets/passive-2018/"
+wget --directory-prefix=/PATH/TO/CAIDA --user=USERNAME --password=PASSWORD --recursive --level=16 --no-parent --no-clobber "https://data.caida.org/datasets/passive-2016/"
+wget --directory-prefix=/PATH/TO/CAIDA --user=USERNAME --password=PASSWORD --recursive --level=16 --no-parent --no-clobber "https://data.caida.org/datasets/passive-2018/"
 ```
 
 ## Process CAIDA Dataset
