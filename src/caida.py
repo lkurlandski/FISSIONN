@@ -190,8 +190,8 @@ def main() -> None:
     parser.add_argument("--root", type=Path, help="/PATH/TO/CAIDA", default=DEFAULT_CAIDA_PATH)
     parser.add_argument("--year", type=str, help="`passive-2016`, `passive-2018` etc.")
     parser.add_argument("--source", type=str, help="`equinix-chicago`, `equinix-nyc` etc.")
-    parser.add_argument("--output", type=Path, default=DEFAULT_DATA_PATH)
-    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--output", type=Path, default=DEFAULT_DATA_PATH, help=f"{str(DEFAULT_DATA_PATH)}")
+    parser.add_argument("--num_workers", type=int, default=1, help="1, 2, 4, etc.")
     args = parser.parse_args()
 
     input_root: Path = args.root / "data.caida.org/datasets/" / args.year / args.source

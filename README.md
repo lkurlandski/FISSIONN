@@ -36,6 +36,11 @@ wget --directory-prefix=/PATH/TO/CAIDA --user=USERNAME --password=PASSWORD --rec
 wget --directory-prefix=/PATH/TO/CAIDA --user=USERNAME --password=PASSWORD --recursive --level=16 --no-parent --no-clobber "https://data.caida.org/datasets/passive-2018/"
 ```
 
+Optionally, get rid of all the uneeded files
+```bash
+find /PATH/TO/CAIDA \( -name "*.html*" -o -name "*.md5" -o -name "*.pdf" \) -type f -exec rm {} +
+```
+
 ## Process CAIDA Dataset
 
 Processing the CAIDA dataset is not required for the demo.
