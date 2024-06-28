@@ -15,7 +15,6 @@ from __future__ import annotations
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter
 from collections.abc import Iterable
 from dataclasses import dataclass
-from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -27,21 +26,21 @@ from typing import Literal, Optional
 import numpy as np
 from sklearn.metrics import accuracy_score
 import torch
-from torch import nn, Tensor, tensor
+from torch import nn, Tensor
 from torch.distributions import Laplace, Uniform, Normal
 from torch.nn import functional as F, CrossEntropyLoss, L1Loss
 from torch.optim import Optimizer, Adam
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-# pylint-disable: wrong-import-position
+# pylint: disable=wrong-import-position
 if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-# pylint-enable: wrong-import-position
 
-from src.caida import stream_caida_data
+from src.caida import stream_caida_data, stream_caida_data_demo, get_caida_ipds
 from src.utils import count_parameters, one_hot_to_binary
+# pylint: enable=wrong-import-position
 
 
 class ShapeError(ValueError):
@@ -241,7 +240,7 @@ class FINNEncoder(nn.Module):
 
 class FINNDecoder(nn.Module):
     # TODO: Should the CNN layers be 2D CNNs? The paper seems to indicate this,
-    # but such a choice is nonsensical given the nature of the decoder input.
+    # but such a choice is unusual given the nature of the decoder input.
 
     def __init__(self, input_size: int, output_size: int) -> None:
         """
@@ -520,6 +519,7 @@ def main():
     parser.add_argument("--device", type=torch.device, default="cpu", help=".")
     parser.add_argument("--disable_tqdm", action="store_true", help=".")
     parser.add_argument("--logging_steps", type=int, default=-1, help=".")
+    parser.add_argument("--demo", action="store_true", help=".")
     args = parser.parse_args()
 
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
@@ -527,20 +527,16 @@ def main():
 
     seed_everything(args.seed)
 
-    tr_stream = stream_caida_data(year="passive-2016", source="equinix-chicago")
-    vl_stream = stream_caida_data(year="passive-2018", source="equinix-nyc")
-    # FIXME:
-    # vl_stream = stream_caida_data(year="passive-2018", source="equinix-nyc")
-    vl_stream = stream_caida_data(year="passive-2016", source="equinix-chicago")
+    stream_caida = stream_caida_data_demo if args.demo else stream_caida_data
+    tr_stream = stream_caida(year="passive-2016", source="equinix-chicago")
+    vl_stream = stream_caida(year="passive-2018", source="equinix-nyc")
+    tr_ipds = get_caida_ipds(tr_stream, args.min_flow_length, args.max_flow_length, args.tr_num_samples)
+    vl_ipds = get_caida_ipds(vl_stream, args.min_flow_length, args.max_flow_length, args.vl_num_samples)
 
-    def get_ipds(stream: Iterable, num_samples: int):
-        ipds = (np.array(sample.ipds, dtype=np.int32) for sample in stream)
-        ipds = filter(lambda x: args.min_flow_length <= len(x) <= args.max_flow_length, ipds)
-        ipds = list(tqdm(islice(ipds, num_samples), total=num_samples, desc="Loading IPDs..."))
-        return ipds
-
-    tr_ipds = get_ipds(tr_stream, args.tr_num_samples)
-    vl_ipds = get_ipds(vl_stream, args.vl_num_samples)
+    print(f"IPDs{' (demo)' if args.demo else ''}:")
+    print(f"Training Size: {len(tr_ipds)}. Mean Length: {np.mean([len(ipd) for ipd in tr_ipds])}")
+    print(f"Validation Size: {len(vl_ipds)}. Mean Length: {np.mean([len(ipd) for ipd in vl_ipds])}")
+    print("-" * 80)
 
     tr_dataset = FINNDataset(
         tr_ipds,
