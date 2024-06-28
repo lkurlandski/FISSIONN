@@ -12,9 +12,12 @@ CITATION
 """
 
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -44,7 +47,7 @@ from src.caida import (
     get_caida_ipds,
     CaidaSample,  # pylint: disable=unused-import  # Needed because of pickle
 )
-from src.utils import count_parameters, one_hot_to_binary
+from src.utils import count_parameters, one_hot_to_binary, tensor_memory_size
 # pylint: enable=wrong-import-position
 
 
@@ -63,7 +66,7 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-class FINNDataset(Dataset):
+class FINNDataset(Dataset, ABC):
     # TODO: the manner to produce noise is a tad ambigious.
     # This implementation uses a uniform distribution to sample the noise deviation.
     # This noise deviation is then used as the `scale` of the Laplace distribition to sample the noise.
@@ -76,35 +79,115 @@ class FINNDataset(Dataset):
         noise_deviation_low: int,
         noise_deviation_high: int,
     ) -> None:
+        self.ipds = [torch.from_numpy(ipd).to(torch.float32) for ipd in ipds]
         self.fingerprint_length = fingerprint_length
-        self.amplitude = amplitude
-        self.sampler_uniform = Uniform(noise_deviation_low, noise_deviation_high)
-        self.sampler_delay = Laplace(loc=0, scale=amplitude)
-        self.ipds = ipds
+        self.aplitude = amplitude
+        self.noise_deviation_low = noise_deviation_low
+        self.noise_deviation_high = noise_deviation_high
+        self.delay_sampler = Laplace(0, amplitude)
+        self.noise_sampler_sampler = Uniform(noise_deviation_low, noise_deviation_high)
+        self.__post_init__()
 
-    @property
-    def noise_sampler(self) -> Normal:
-        return Laplace(loc=0, scale=self.sampler_uniform.sample().item())
+    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        ipd = self.get_ipd(idx)
+        fingerprint = self.get_fingerprint(idx)
+        delay = self.get_delay(idx)
+        noise = self.get_noise(idx)
+        return fingerprint, ipd, delay, noise
 
     def __len__(self) -> int:
         return len(self.ipds)
 
-    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        Args:
-          idx: Index of the sample to retrieve.
+    def __post_init__(self) -> None:
+        pass
 
-        Return:
-          fingerprint: The fingerprint of the flow. Contains log_2(fingerprint_length) bits information.
-          ipd: The inter-packet delay of the flow.
-          delay: The fingerprint delay of the flow.
-          noise: The noise to add to the flow.
-        """
-        ipd = torch.from_numpy(self.ipds[idx])
-        fingerprint = torch.eye(self.fingerprint_length)[torch.randint(self.fingerprint_length, (1,))].squeeze(0)
-        delay = self.sampler_delay.sample((len(ipd),)).abs()
-        noise = self.noise_sampler.sample((len(ipd),)).abs()
-        return fingerprint, ipd, delay, noise
+    def _get_ipd(self, idx: int) -> Tensor:
+        return self.ipds[idx]
+
+    def _get_fingerprint(self, length: int) -> Tensor:
+        f = torch.zeros((length,))
+        r = torch.randint(0, length, (1,))
+        f[r] = 1.0
+        return f
+
+    def _get_delay(self, length: int) -> Tensor:
+        return self.delay_sampler.sample((length,)).abs()
+
+    def _get_noise(self, length: int) -> Tensor:
+        sampler = Laplace(0, self.noise_sampler_sampler.sample().abs().item())
+        return sampler.sample((length,)).abs()
+
+    @property
+    @abstractmethod
+    def memory_size(self) -> int:
+        ...
+
+    @abstractmethod
+    def get_ipd(self, idx: int) -> Tensor:
+        ...
+
+    @abstractmethod
+    def get_fingerprint(self, idx: int) -> Tensor:
+        ...
+
+    @abstractmethod
+    def get_delay(self, idx: int) -> Tensor:
+        ...
+
+    @abstractmethod
+    def get_noise(self, idx: int) -> Tensor:
+        ...
+
+
+class DynamicFINNDataset(FINNDataset):
+
+    def memory_size(self) -> int:
+        return sum(tensor_memory_size(x) for x in self.ipds)
+
+    def get_ipd(self, idx: int) -> Tensor:
+        return self._get_ipd(idx)
+
+    def get_fingerprint(self, idx: int) -> Tensor:  # pylint: disable=unused-argument
+        return self._get_fingerprint(self.fingerprint_length)
+
+    def get_delay(self, idx: int) -> Tensor:
+        ipd = self.get_ipd(idx)
+        return self._get_delay(len(ipd))
+
+    def get_noise(self, idx: int) -> Tensor:
+        ipd = self.get_ipd(idx)
+        return self._get_noise(len(ipd))
+
+
+class StaticFINNDataset(FINNDataset):
+
+    def __post_init__(self) -> None:
+        iterable = tqdm(self.ipds, total=len(self), desc="Generating Fingerprints...")
+        self.fingerprints = [self._get_fingerprint(self.fingerprint_length) for _ in iterable]
+        iterable = tqdm(self.ipds, total=len(self), desc="Generating Delays...")
+        self.delays = [self._get_delay(len(ipd)) for ipd in iterable]
+        iterable = tqdm(self.ipds, total=len(self), desc="Generating Noises...")
+        self.noises = [self._get_noise(len(ipd)) for ipd in iterable]
+
+    @property
+    def memory_size(self) -> int:
+        m_ipds = sum(tensor_memory_size(x) for x in self.ipds)
+        m_fingerprints = sum(tensor_memory_size(x) for x in self.fingerprints)
+        m_delays = sum(tensor_memory_size(x) for x in self.delays)
+        m_noises = sum(tensor_memory_size(x) for x in self.noises)
+        return m_ipds + m_fingerprints + m_delays + m_noises
+
+    def get_ipd(self, idx: int) -> Tensor:
+        return self._get_ipd(idx)
+
+    def get_fingerprint(self, idx: int) -> Tensor:
+        return self.fingerprints[idx]
+
+    def get_delay(self, idx: int) -> Tensor:
+        return self.delays[idx]
+
+    def get_noise(self, idx: int) -> Tensor:
+        return self.noises[idx]
 
 
 class FINNCollateFn:
@@ -503,6 +586,9 @@ class FINNTrainer:
 
 def main():
 
+    print(f"STARTING {datetime.now().isoformat()}")
+    print("-" * 80)
+
     parser = ArgumentParser(formatter_class=type("F", (ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter), {}))
     parser.add_argument("--fingerprint_length", type=int, default=512, help=".")
     parser.add_argument("--flow_length", type=int, default=150, help=".")
@@ -524,6 +610,7 @@ def main():
     parser.add_argument("--device", type=torch.device, default="cpu", help=".")
     parser.add_argument("--disable_tqdm", action="store_true", help=".")
     parser.add_argument("--logging_steps", type=int, default=-1, help=".")
+    parser.add_argument("--dynamic", action="store_true", help=".")
     parser.add_argument("--demo", action="store_true", help=".")
     args = parser.parse_args()
 
@@ -543,23 +630,19 @@ def main():
     print(f"Validation Size: {len(vl_ipds)}. Mean Length: {np.mean([len(ipd) for ipd in vl_ipds])}")
     print("-" * 80)
 
-    tr_dataset = FINNDataset(
-        tr_ipds,
-        args.fingerprint_length,
-        args.amplitude,
-        args.noise_deviation_low,
-        args.noise_deviation_high,
+    DatasetConstructor = DynamicFINNDataset if args.dynamic else StaticFINNDataset
+    DatasetConstructor = partial(
+        DatasetConstructor,
+        fingerprint_length=args.fingerprint_length,
+        amplitude=args.amplitude,
+        noise_deviation_low=args.noise_deviation_low,
+        noise_deviation_high=args.noise_deviation_high,
     )
-    vl_dataset = FINNDataset(
-        vl_ipds,
-        args.fingerprint_length,
-        args.amplitude,
-        args.noise_deviation_low,
-        args.noise_deviation_high,
-    )
+    tr_dataset = DatasetConstructor(tr_ipds)
+    vl_dataset = DatasetConstructor(vl_ipds)
 
-    print(f"Training Dataset:\n{tr_dataset}")
-    print(f"Validation Dataset:\n{vl_dataset}")
+    print(f"Training Dataset:\n{tr_dataset}\nMemory Size: {tr_dataset.memory_size}")
+    print(f"Validation Dataset:\n{vl_dataset}\nMemory Size: {vl_dataset.memory_size}")
     print("-" * 80)
 
     model = FINNModel(args.fingerprint_length, args.flow_length)
@@ -584,6 +667,9 @@ def main():
     trainer = FINNTrainer(training_arguments, model, tr_dataset, vl_dataset, collate_fn, loss_fn, optimizer)
 
     trainer()
+
+    print(f"ENDING {datetime.now().isoformat()}")
+    print("-" * 80)
 
 
 if __name__ == "__main__":
