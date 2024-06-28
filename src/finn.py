@@ -38,7 +38,12 @@ from tqdm import tqdm
 if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.caida import stream_caida_data, stream_caida_data_demo, get_caida_ipds
+from src.caida import (
+    stream_caida_data,
+    stream_caida_data_demo,
+    get_caida_ipds,
+    CaidaSample,  # pylint: disable=unused-import  # Needed because of pickle
+)
 from src.utils import count_parameters, one_hot_to_binary
 # pylint: enable=wrong-import-position
 
