@@ -40,6 +40,10 @@ def count_parameters(model: nn.Module, requires_grad: bool = False) -> int:
     return sum(p.numel() for p in model.parameters() if (not requires_grad or p.requires_grad))
 
 
+def tensor_memory_size(x: Tensor) -> int:
+    return x.element_size() * x.nelement()
+
+
 def test():
 
     x = tensor([
