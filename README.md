@@ -1,9 +1,5 @@
 # README
 
-## TODO
-
-- adjust caida.py to take a CAIDA root argument, then adjust the download scripts accordingly...
-
 ## Set up Environment
 
 ```bash
