@@ -25,10 +25,11 @@ from tempfile import NamedTemporaryFile
 import time
 from typing import Generator, NamedTuple
 
-import dpkt
-from scapy.all import rdpcap
 import numpy as np
-import pyshark
+try:
+    import pyshark
+except ModuleNotFoundError:
+    print("Failed to import pyshark. IPDs cannot be extracted from CAIDA data.")
 from tqdm import tqdm
 
 
