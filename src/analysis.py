@@ -44,7 +44,7 @@ class FINNTrainerAnalyzer:
             fig.savefig(self.outdir / f"{k}.png")
             plt.close(fig)
 
-        fig, _ = self.plot(["tr_weighted_loss", "vl_weighted_loss", "extraction_rate"])
+        fig, _ = self.plot(["tr_weighted_loss", "vl_weighted_loss", "vl_extraction_rate", "vl_bit_error_rate"])
         fig.savefig(self.outdir / "main.png")
         plt.close(fig)
 

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 import json
+import math
 import os
 from pathlib import Path
 from pprint import pformat, pprint
@@ -569,8 +570,8 @@ class FINNTrainer:
             "vl_weighted_loss": cum_weighted_loss / cum_samples,
             "vl_encoder_loss": cum_encoder_loss / cum_samples,
             "vl_decoder_loss": cum_decoder_loss / cum_samples,
-            "bit_error_rate": bit_errors / cum_samples,
-            "extraction_rate": accuracy_score(y_true, y_pred),
+            "vl_bit_error_rate": bit_errors / (cum_samples * math.log2(self.args.fingerprint_length)),
+            "vl_extraction_rate": accuracy_score(y_true, y_pred),
         }
 
         return d
