@@ -38,7 +38,7 @@ VERBOSE = True
 
 
 def decompress(f: Path) -> Path:
-    temp_file = NamedTemporaryFile(delete=False)  # pylint: disable=consider-using-with
+    temp_file = NamedTemporaryFile(delete=False, prefix="tmp-py-caida", dir="./tmp")  # pylint: disable=consider-using-with
     with gzip.open(f, "rb") as f_in:
         with open(temp_file.name, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
