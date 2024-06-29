@@ -8,7 +8,7 @@ import sys
 
 
 parser = ArgumentParser()
-parser.add_argument("--device", type=str, default="cuda:0", help="`cpu`, `cuda:0`, `cuda:1`, etc.")
+parser.add_argument("--device", type=int, default=0, help="-1, 0, 1, etc. for CPU, GPU, etc.")
 parser.add_argument("--demo", action="store_true", help="Run demo experiments")
 args = parser.parse_args()
 
@@ -51,7 +51,7 @@ def get_body(
     --learning_rate=1e-4 \\
     --dataloader_num_workers=4 \\
     {'--demo \\' if args.demo else 'REMOVE'}
-    --device=cuda:{args.device} > {logfile} 2>&1
+    --device={'cuda:0' if args.device >= 0 else 'cpu'} > {logfile} 2>&1
     """.replace("    ", "").replace("REMOVE\n", "")
 
 
@@ -159,5 +159,4 @@ with open(runfile, "w") as f:
 # Convienient run script.
 
 with open("./run/run.sh", "w") as f:
-    cuda_visible_devices = "-1" if args.device == "cpu" else args.device.split(":")[-1]
-    f.write("\n".join([f"CUDA_VISIBLE_DEVICES={cuda_visible_devices} bash {runfile}" for runfile in runfiles]) + "\n")
+    f.write("\n".join([f"CUDA_VISIBLE_DEVICES={args.device} bash {runfile}" for runfile in runfiles]) + "\n")
