@@ -28,6 +28,7 @@ from typing import Literal, Optional
 
 import numpy as np
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 import torch
 from torch import nn, Tensor
 from torch.distributions import Laplace, Uniform, Normal
@@ -611,6 +612,7 @@ def main():
     parser.add_argument("--disable_tqdm", action="store_true", help=".")
     parser.add_argument("--logging_steps", type=int, default=-1, help=".")
     parser.add_argument("--dynamic", action="store_true", help=".")
+    parser.add_argument("--use_same_dataset", action="store_true", help=".")
     parser.add_argument("--demo", action="store_true", help=".")
     args = parser.parse_args()
 
@@ -620,10 +622,15 @@ def main():
     seed_everything(args.seed)
 
     stream_caida = stream_caida_data_demo if args.demo else stream_caida_data
-    tr_stream = stream_caida(year="passive-2016", source="equinix-chicago")
-    vl_stream = stream_caida(year="passive-2018", source="equinix-nyc")
-    tr_ipds = get_caida_ipds(tr_stream, args.min_flow_length, args.max_flow_length, args.tr_num_samples)
-    vl_ipds = get_caida_ipds(vl_stream, args.min_flow_length, args.max_flow_length, args.vl_num_samples)
+    if args.use_same_dataset:
+        stream = stream_caida(year="passive-2016", source="equinix-chicago")
+        ipds = get_caida_ipds(stream, args.min_flow_length, args.max_flow_length, args.tr_num_samples + args.vl_num_samples)
+        tr_ipds, vl_ipds = train_test_split(ipds, test_size=args.vl_num_samples)
+    else:
+        tr_stream = stream_caida(year="passive-2016", source="equinix-chicago")
+        vl_stream = stream_caida(year="passive-2018", source="equinix-nyc")
+        tr_ipds = get_caida_ipds(tr_stream, args.min_flow_length, args.max_flow_length, args.tr_num_samples)
+        vl_ipds = get_caida_ipds(vl_stream, args.min_flow_length, args.max_flow_length, args.vl_num_samples)
 
     print(f"IPDs{' (demo)' if args.demo else ''}:")
     print(f"Training Size: {len(tr_ipds)}. Mean Length: {np.mean([len(ipd) for ipd in tr_ipds])}")
