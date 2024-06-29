@@ -619,6 +619,9 @@ def main():
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
     print("-" * 80)
 
+    if args.outfile.exists():
+        raise FileExistsError(f"Logfile already exists: {args.outfile}")
+
     seed_everything(args.seed)
 
     stream_caida = stream_caida_data_demo if args.demo else stream_caida_data
