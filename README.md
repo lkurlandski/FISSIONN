@@ -18,7 +18,7 @@ Our implementation uses Python and Pytorch. Wireshark and pyshark are not requir
 ```bash
 sudo apt install wireshark
 
-conda create -n TrafficAnal python=3.12 pytorch=2.3.0 torchvision=0.18.0 torchaudio=2.3.0 torchtext=0.18.0 pytorch-cuda=12.1 scikit-learn scipy pandas scikit-learn -c pytorch -c nvidia -c conda-forge
+conda create -n TrafficAnal python=3.12 pytorch=2.3.0 torchvision=0.18.0 torchaudio=2.3.0 torchtext=0.18.0 pytorch-cuda=12.1 scikit-learn scipy pandas scikit-learn matplotlib -c pytorch -c nvidia -c conda-forge
 
 conda activate TrafficAnal
 
