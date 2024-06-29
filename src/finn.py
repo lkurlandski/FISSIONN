@@ -25,6 +25,7 @@ from pathlib import Path
 from pprint import pformat, pprint
 import random
 import sys
+import time
 from typing import Literal, Optional
 
 import numpy as np
@@ -427,7 +428,7 @@ class FINNModel(nn.Module):
 
 @dataclass
 class FINNTrainerArgs:
-    outfile: Path
+    outdir: Path
     num_train_epochs: int = 1
     batch_size: int = 1
     dataloader_num_workers: int = 0
@@ -459,9 +460,9 @@ class FINNTrainer:
         self.log = []
 
     def __call__(self) -> None:
-        if self.args.outfile.exists():
-            raise FileExistsError(f"Logfile already exists: {self.args.outfile}")
-        self.args.outfile.parent.mkdir(parents=True, exist_ok=True)
+        if self.args.outdir.exists():
+            raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
+        self.args.outdir.mkdir(parents=True, exist_ok=True)
 
         tr_metrics = {"tr_weighted_loss": float("nan"), "tr_encoder_loss": float("nan"), "tr_decoder_loss": float("nan")}
         vl_metrics = self.evaluate()
@@ -476,7 +477,7 @@ class FINNTrainer:
             d = {"epoch": epoch} | tr_metrics | vl_metrics
             self.log.append(d)
             print(self._fmt_dict(d))
-            with open(self.args.outfile, "a") as fp:
+            with open(self.args.outdir / "results.jsonl", "a") as fp:
                 fp.write(json.dumps(d) + "\n")
 
     def _get_pbar(self, iterable: Iterable, **kwds) -> tqdm | Iterable:
@@ -488,6 +489,7 @@ class FINNTrainer:
         return {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
 
     def train(self) -> dict[str, float]:
+        t_0 = time.time()
         self.model.train()
         cum_samples, cum_weighted_loss, cum_encoder_loss, cum_decoder_loss = 0, 0, 0, 0
         log_samples, log_weighted_loss, log_encoder_loss, log_decoder_loss = 0, 0, 0, 0
@@ -530,14 +532,16 @@ class FINNTrainer:
             "tr_weighted_loss": cum_weighted_loss / cum_samples,
             "tr_encoder_loss": cum_encoder_loss / cum_samples,
             "tr_decoder_loss": cum_decoder_loss / cum_samples,
+            "tr_time": time.time() - t_0,
         }
 
         return d
 
     def evaluate(self) -> dict[str, float]:
+        t_0 = time.time()
         self.model.eval()
         cum_samples, cum_weighted_loss, cum_encoder_loss, cum_decoder_loss = 0, 0, 0, 0
-        bit_errors, y_true, y_pred = 0, [], []
+        bit_error_rates, y_true, y_pred = 0, [], []
         dataloader = self.get_dataloader(self.vl_dataset, shuffle=False)
         pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
         for batch in pbar:
@@ -556,7 +560,7 @@ class FINNTrainer:
             binary_fingerprint = one_hot_to_binary(fingerprint).to(bool)
             binary_predictions = one_hot_to_binary(one_hot_predictions).to(bool)
             bit_difference = binary_fingerprint ^ binary_predictions
-            bit_errors += bit_difference.sum().item()
+            bit_error_rates += (bit_difference.sum().item() / math.log2(fingerprint.size(1)))
 
             cum_samples += fingerprint.size(0)
             cum_weighted_loss += weighted_loss.item()
@@ -570,8 +574,9 @@ class FINNTrainer:
             "vl_weighted_loss": cum_weighted_loss / cum_samples,
             "vl_encoder_loss": cum_encoder_loss / cum_samples,
             "vl_decoder_loss": cum_decoder_loss / cum_samples,
-            "vl_bit_error_rate": bit_errors / (cum_samples * math.log2(self.args.fingerprint_length)),
+            "vl_bit_error_rate": bit_error_rates / cum_samples,
             "vl_extraction_rate": accuracy_score(y_true, y_pred),
+            "vl_time": time.time() - t_0,
         }
 
         return d
@@ -604,7 +609,7 @@ def main():
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--outfile", type=Path, default=Path("./output/tmp.jsonl"), help=".")
+    parser.add_argument("--outdir", type=Path, default=Path("./output/tmp.jsonl"), help=".")
     parser.add_argument("--num_train_epochs", type=int, default=1, help=".")
     parser.add_argument("--batch_size", type=int, default=2, help=".")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help=".")
@@ -620,8 +625,8 @@ def main():
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
     print("-" * 80)
 
-    if args.outfile.exists():
-        raise FileExistsError(f"Logfile already exists: {args.outfile}")
+    if args.outdir.exists():
+        raise FileExistsError(f"Output Directory Already Exists: {args.outdir}")
 
     seed_everything(args.seed)
 
@@ -652,8 +657,10 @@ def main():
     tr_dataset = DatasetConstructor(tr_ipds)
     vl_dataset = DatasetConstructor(vl_ipds)
 
-    print(f"Training Dataset:\n{tr_dataset}\nMemory Size: {tr_dataset.memory_size}")
-    print(f"Validation Dataset:\n{vl_dataset}\nMemory Size: {vl_dataset.memory_size}")
+    print(f"Training Dataset:\n{tr_dataset}")
+    print(f"Memory Size: {round(tr_dataset.memory_size / 1e9, 2)}GB")
+    print(f"Validation Dataset:\n{vl_dataset}")
+    print(f"Memory Size: {round(vl_dataset.memory_size / 1e9, 2)}GB")
     print("-" * 80)
 
     model = FINNModel(args.fingerprint_length, args.flow_length)
@@ -664,7 +671,7 @@ def main():
     print("-" * 80)
 
     training_arguments = FINNTrainerArgs(
-        outfile=args.outfile,
+        outdir=args.outdir,
         num_train_epochs=args.num_train_epochs,
         batch_size=args.batch_size,
         dataloader_num_workers=args.dataloader_num_workers,

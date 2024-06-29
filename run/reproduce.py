@@ -1,5 +1,10 @@
 """
 Creates bash files to run synthetic experiments.
+
+Profiling:
+  - Ran four experiments with dataloader_num_workers in (4, 8) and batch_size in (1024, 4096).
+  - Counterintuitively, the fastest run was dataloader_num_workers==4 and batch_size==1024.
+  - Smaller batch size had more gradient updates, so obviously, this had better metrics.
 """
 
 from argparse import ArgumentParser
@@ -22,7 +27,7 @@ def get_body(
     tr_num_samples: int,
     vl_num_samples: int,
     num_train_epochs: int,
-    outfile: str,
+    outdir: str,
     logfile: str,
 ) -> str:
     return f"""#!/bin/bash -l
@@ -30,7 +35,7 @@ def get_body(
     source ~/anaconda3/etc/profile.d/conda.sh
     conda activate TrafficAnal
 
-    echo "Running {Path(outfile).stem}..."
+    echo "Running {outdir}..."
 
     python -u src/finn.py \\
     --fingerprint_length={fingerprint_length} \\
@@ -45,7 +50,7 @@ def get_body(
     --tr_num_samples={tr_num_samples} \\
     --vl_num_samples={vl_num_samples} \\
     --seed=0 \\
-    --outfile={outfile} \\
+    --outdir={outdir} \\
     --num_train_epochs={num_train_epochs} \\
     --batch_size=1024 \\
     --learning_rate=1e-4 \\
@@ -64,7 +69,7 @@ for tr_num_samples in (200000, 500000):
     for fingerprint_length in (512, 1024, 2048, 4096, 8192, 16384):
         jobname = f"E1--{tr_num_samples}--{fingerprint_length}"
         logfile = f"./logs/{jobname}.log"
-        outfile = f"./output/{jobname}.jsonl"
+        outdir = f"./output/{jobname}"
         runfile = f"./run/{jobname}.sh"
         body = get_body(
             fingerprint_length=fingerprint_length,
@@ -75,7 +80,7 @@ for tr_num_samples in (200000, 500000):
             tr_num_samples=tr_num_samples,
             vl_num_samples=50000,
             num_train_epochs=100,
-            outfile=outfile,
+            outdir=outdir,
             logfile=logfile,
         )
         with open(runfile, "w") as f:
@@ -89,7 +94,7 @@ for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3),
     for amplitude in (5e-3, 10e-3, 20e-3, 30e-3, 40e-3):
         jobname = f"E2--{noise_deviation_low}--{noise_deviation_high}--{amplitude}"
         logfile = f"./logs/{jobname}.log"
-        outfile = f"./output/{jobname}.jsonl"
+        outdir = f"./output/{jobname}"
         runfile = f"./run/{jobname}.sh"
         body = get_body(
             fingerprint_length=4096,
@@ -100,7 +105,7 @@ for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3),
             tr_num_samples=200000,
             vl_num_samples=50000,
             num_train_epochs=100,
-            outfile=outfile,
+            outdir=outdir,
             logfile=logfile,
         )
         with open(runfile, "w") as f:
@@ -115,7 +120,7 @@ for tr_num_samples in (200000, 500000):
         for flow_length in (50, 100, 150):
             jobname = f"E3--{tr_num_samples}--{num_train_epochs}--{flow_length}"
             logfile = f"./logs/{jobname}.log"
-            outfile = f"./output/{jobname}.jsonl"
+            outdir = f"./output/{jobname}"
             runfile = f"./run/{jobname}.sh"
             body = get_body(
                 fingerprint_length=1024,
@@ -126,7 +131,7 @@ for tr_num_samples in (200000, 500000):
                 tr_num_samples=tr_num_samples,
                 vl_num_samples=50000,
                 num_train_epochs=num_train_epochs,
-                outfile=outfile,
+                outdir=outdir,
                 logfile=logfile,
             )
             with open(runfile, "w") as f:
@@ -138,18 +143,18 @@ for tr_num_samples in (200000, 500000):
 
 jobname = f"test"
 logfile = f"./logs/{jobname}.log"
-outfile = f"./output/{jobname}.jsonl"
+outdir = f"./output/{jobname}"
 runfile = f"./run/{jobname}.sh"
 body = get_body(
     fingerprint_length=16384,
     flow_length=150,
-    amplitude=5e-3,
+    amplitude=40e-3,
     noise_deviation_low=2e-3,
     noise_deviation_high=10e-3,
     tr_num_samples=100000,
     vl_num_samples=10000,
     num_train_epochs=1,
-    outfile=outfile,
+    outdir=outdir,
     logfile=logfile,
 )
 with open(runfile, "w") as f:

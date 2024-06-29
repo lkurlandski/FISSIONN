@@ -15,16 +15,14 @@ from matplotlib.figure import Figure
 
 class FINNTrainerAnalyzer:
 
-    def __init__(self, outfile: Path | os.PathLike, outdir: Path | os.PathLike) -> None:
-        self.outfile = Path(outfile)
+    def __init__(self, outdir: Path | os.PathLike) -> None:
         self.outdir = Path(outdir)
         self.log: list[dict[str, float]] = []
         self.data: dict[str, list[float] | np.ndarray] = {}
 
     def __call__(self) -> Self:
-        self.outdir.mkdir(exist_ok=True, parents=True)
 
-        with open(self.outfile, "r") as fp:
+        with open(self.outdir / "results.jsonl", "r") as fp:
             for line in fp:
                 self.log.append(json.loads(line))
 
@@ -70,6 +68,6 @@ class FINNTrainerAnalyzer:
 
 
 if __name__ == "__main__":
-    for outfile in Path("./output").glob("*.jsonl"):
-        analyzer = FINNTrainerAnalyzer(outfile, outfile.with_suffix(""))
+    for outdir in sorted((p for p in Path("./output").iterdir() if p.is_dir())):
+        analyzer = FINNTrainerAnalyzer(outdir)
         analyzer = analyzer()
