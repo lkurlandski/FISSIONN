@@ -8,7 +8,7 @@ import sys
 
 
 parser = ArgumentParser()
-parser.add_argument("--device", type=str, default="0", help="CUDA_VISIBLE_DEVICES={device}")
+parser.add_argument("--device", type=str, default="cuda:0", help="`cpu`, `cuda:0`, `cuda:1`, etc.")
 parser.add_argument("--demo", action="store_true", help="Run demo experiments")
 args = parser.parse_args()
 
@@ -159,4 +159,5 @@ with open(runfile, "w") as f:
 # Convienient run script.
 
 with open("./run/run.sh", "w") as f:
-    f.write("\n".join([f"CUDA_VISIBLE_DEVICES={args.device} bash {runfile}" for runfile in runfiles]) + "\n")
+    cuda_visible_devices = "-1" if args.device == "cpu" else args.device.split(":")[-1]
+    f.write("\n".join([f"CUDA_VISIBLE_DEVICES={cuda_visible_devices} bash {runfile}" for runfile in runfiles]) + "\n")
