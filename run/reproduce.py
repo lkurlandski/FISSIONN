@@ -74,7 +74,7 @@ for tr_num_samples in (200000, 500000):
         body = get_body(
             fingerprint_length=fingerprint_length,
             flow_length=100,
-            amplitude=5e-3,
+            amplitude=40e-3,
             noise_deviation_low=2e-3,
             noise_deviation_high=10e-3,
             tr_num_samples=tr_num_samples,
@@ -125,7 +125,7 @@ for tr_num_samples in (200000, 500000):
             body = get_body(
                 fingerprint_length=1024,
                 flow_length=flow_length,
-                amplitude=5e-3,
+                amplitude=40e-3,
                 noise_deviation_low=2e-3,
                 noise_deviation_high=10e-3,
                 tr_num_samples=tr_num_samples,
