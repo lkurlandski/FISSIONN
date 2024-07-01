@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
+import gc
 import json
 import math
 import os
@@ -81,14 +82,28 @@ class FINNDataset(Dataset, ABC):
         amplitude: int,
         noise_deviation_low: int,
         noise_deviation_high: int,
+        as_tensors: bool = False,
+        flow_length: Optional[int] = None,
+        pad_value: int = 0,
     ) -> None:
+        if as_tensors and not isinstance(flow_length, int):
+            raise ValueError("If `as_tensors` is True, a `flow_length` must be provided.")
+
         self.ipds = [torch.from_numpy(ipd).to(torch.float32) for ipd in ipds]
         self.fingerprint_length = fingerprint_length
         self.aplitude = amplitude
         self.noise_deviation_low = noise_deviation_low
         self.noise_deviation_high = noise_deviation_high
+        self.as_tensors = as_tensors
+        self.flow_length = flow_length
+        self.pad_value = pad_value
         self.delay_sampler = Laplace(0, amplitude)
         self.noise_sampler_sampler = Uniform(noise_deviation_low, noise_deviation_high)
+
+        if self.as_tensors:
+            self.ipds = [ipd[0: self.flow_length] for ipd in self.ipds]
+            self.ipds = pad_sequence(self.ipds, True, self.pad_value)
+
         self.__post_init__()
 
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -103,6 +118,25 @@ class FINNDataset(Dataset, ABC):
 
     def __post_init__(self) -> None:
         pass
+
+    def __repr__(self) -> str:
+        s = f"{self.__class__.__name__}(\n"
+        s += f"  ipds={len(self.ipds)},\n"
+        s += f"  fingerprint_length={self.fingerprint_length},\n"
+        s += f"  amplitude={self.aplitude},\n"
+        s += f"  noise_deviation_low={self.noise_deviation_low},\n"
+        s += f"  noise_deviation_high={self.noise_deviation_high},\n"
+        s += f"  as_tensors={self.as_tensors},\n"
+        s += f"  flow_length={self.flow_length},\n"
+        s += f"  pad_value={self.pad_value},\n"
+        s += f"  delay_sampler={self.delay_sampler},\n"
+        s += f"  noise_sampler_sampler={self.noise_sampler_sampler},\n"
+        s += f"  memory_size={self.memory_size},\n"
+        s += f")"
+        return s
+
+    def __str__(self) -> str:
+        return str(self)
 
     def _get_ipd(self, idx: int) -> Tensor:
         return self.ipds[idx]
@@ -171,6 +205,13 @@ class StaticFINNDataset(FINNDataset):
         self.delays = [self._get_delay(len(ipd)) for ipd in iterable]
         iterable = tqdm(self.ipds, total=len(self), desc="Generating Noises...")
         self.noises = [self._get_noise(len(ipd)) for ipd in iterable]
+
+        if self.as_tensors:
+            # If True, the ipds should have already been padded to the same length, so we can stack
+            # without concern that the tensors may have different lengths.
+            self.fingerprints = torch.stack(self.fingerprints, dim=0)
+            self.delays = torch.stack(self.delays, dim=0)
+            self.noises = torch.stack(self.noises, dim=0)
 
     @property
     def memory_size(self) -> int:
@@ -653,9 +694,12 @@ def main():
         amplitude=args.amplitude,
         noise_deviation_low=args.noise_deviation_low,
         noise_deviation_high=args.noise_deviation_high,
+        as_tensors=True,
+        flow_length=args.flow_length,
     )
     tr_dataset = DatasetConstructor(tr_ipds)
     vl_dataset = DatasetConstructor(vl_ipds)
+    gc.collect()
 
     print(f"Training Dataset:\n{tr_dataset}")
     print(f"Memory Size: {round(tr_dataset.memory_size / 1e9, 2)}GB")
