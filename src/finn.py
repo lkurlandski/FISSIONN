@@ -136,7 +136,7 @@ class FINNDataset(Dataset, ABC):
         return s
 
     def __str__(self) -> str:
-        return str(self)
+        return repr(self)
 
     def _get_ipd(self, idx: int) -> Tensor:
         return self.ipds[idx]
