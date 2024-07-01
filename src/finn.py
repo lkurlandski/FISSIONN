@@ -121,7 +121,7 @@ class FINNDataset(Dataset, ABC):
 
     def __repr__(self) -> str:
         s = f"{self.__class__.__name__}(\n"
-        s += f"  ipds={len(self.ipds)},\n"
+        s += f"  ipds={len(self.ipds)},{self.ipds[0].dtype}\n"
         s += f"  fingerprint_length={self.fingerprint_length},\n"
         s += f"  amplitude={self.aplitude},\n"
         s += f"  noise_deviation_low={self.noise_deviation_low},\n"
@@ -131,7 +131,7 @@ class FINNDataset(Dataset, ABC):
         s += f"  pad_value={self.pad_value},\n"
         s += f"  delay_sampler={self.delay_sampler},\n"
         s += f"  noise_sampler_sampler={self.noise_sampler_sampler},\n"
-        s += f"  memory_size={self.memory_size},\n"
+        s += f"  memory_size={round(self.memory_size / 1e9, 2)}G,\n"
         s += f")"
         return s
 
@@ -702,9 +702,7 @@ def main():
     gc.collect()
 
     print(f"Training Dataset:\n{tr_dataset}")
-    print(f"Memory Size: {round(tr_dataset.memory_size / 1e9, 2)}GB")
     print(f"Validation Dataset:\n{vl_dataset}")
-    print(f"Memory Size: {round(vl_dataset.memory_size / 1e9, 2)}GB")
     print("-" * 80)
 
     model = FINNModel(args.fingerprint_length, args.flow_length)
