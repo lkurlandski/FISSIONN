@@ -177,7 +177,7 @@ def get_caida_ipds(
     num_samples: int = sys.maxsize,
     disable_tqdm: bool = False,
 ) -> list[np.ndarray]:
-    ipds = (np.array(sample.ipds, dtype=np.int32) for sample in stream)
+    ipds = (np.array(sample.ipds, dtype=np.float32) for sample in stream)
     ipds = filter(lambda x: min_flow_length <= len(x) <= max_flow_length, ipds)
     ipds = islice(ipds, num_samples)
     if not disable_tqdm:
