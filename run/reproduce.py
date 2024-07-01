@@ -164,4 +164,6 @@ with open(runfile, "w") as f:
 # Convienient run script.
 
 with open("./run/run.sh", "w") as f:
-    f.write("\n".join([f"CUDA_VISIBLE_DEVICES={args.device} bash {runfile}" for runfile in runfiles]) + "\n")
+    for runfile in runfiles:
+        f.write(f"CUDA_VISIBLE_DEVICES={args.device} bash {runfile}\n")
+        f.write(f"grep ENDING ./logs/{Path(runfile).stem}.log\n")
