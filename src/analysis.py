@@ -35,22 +35,27 @@ class FINNTrainerAnalyzer:
                 self.data[k].append(v)
         self.data = {k: np.array(v) for k, v in self.data.items()}
 
+        return self
+
+    def plot(self) -> Self:
+
         for k, v in self.data.items():
             if k == "epoch":
                 continue
-            fig, _ = self.plot(k)
+            fig, _ = self._plot(k)
             fig.savefig(self.outdir / f"{k}.png")
             plt.close(fig)
 
-        fig, _ = self.plot(["tr_weighted_loss", "vl_weighted_loss", "vl_extraction_rate", "vl_bit_error_rate"])
+        fig, _ = self._plot(["tr_weighted_loss", "vl_weighted_loss", "vl_extraction_rate", "vl_bit_error_rate"])
         fig.savefig(self.outdir / "main.png")
         plt.close(fig)
 
-        fig, _ = self.plot([k for k in self.data.keys() if k != "epoch"])
+        fig, _ = self._plot([k for k in self.data.keys() if k != "epoch"])
         fig.savefig(self.outdir / "all.png")
         plt.close(fig)
+        return self
 
-    def plot(self, keys: str | list[str]) -> tuple[Figure, Axes]:
+    def _plot(self, keys: str | list[str]) -> tuple[Figure, Axes]:
         keys = [keys] if isinstance(keys, str) else keys
 
         fig, ax = plt.subplots()
