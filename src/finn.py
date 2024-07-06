@@ -178,6 +178,7 @@ class FINNDataset(Dataset, ABC):
 
 class DynamicFINNDataset(FINNDataset):
 
+    @property
     def memory_size(self) -> int:
         return sum(tensor_memory_size(x) for x in self.ipds)
 
