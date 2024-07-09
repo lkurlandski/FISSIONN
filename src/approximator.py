@@ -4,6 +4,7 @@ TODO:
  - The train and test split should be formed from distinct groups!
 """
 
+from __future__ import annotations
 from collections.abc import Iterable
 from itertools import chain, combinations
 import json
@@ -14,6 +15,7 @@ import sys
 import time
 from typing import Optional
 
+from sklearn.model_selection import train_test_split
 import torch
 from torch import nn, Tensor
 from torch.optim import Optimizer, AdamW
@@ -52,25 +54,20 @@ class ApproximatorDataset(Dataset):
     def __repr__(self) -> str:
         s = "ApproximatorDataset("
         s += f"num_pairs={len(self)}, "
-        s += f"basal_loss={self.basal_loss:.6f}"
         s += ")"
         return s
 
     def __str__(self) -> str:
         return repr(self)
 
-    @property
-    def basal_loss(self) -> float:
-        if self._basal_loss is not None:
-            return self._basal_loss
-        self._basal_loss = 0
-
+    @staticmethod
+    def compute_basal_loss(dataset: ApproximatorDataset) -> float:
         collate_fn = CollateFn(max_length=256)
         loss_fn = ApproximatorLossFn(pad_to_same_length=True)
-        for x, y in tqdm(DataLoader(self, batch_size=1024, collate_fn=collate_fn), desc="Computing Basal Loss..."):
-            self._basal_loss += loss_fn.forward(y, x).item()
-        self._basal_loss /= len(self)
-        return self._basal_loss
+        dataloader = DataLoader(dataset, batch_size=1024, collate_fn=collate_fn)
+        pbar = tqdm(dataloader, desc="Computing Basal Loss...")
+        loss = sum(loss_fn.forward(y, x).item() for x, y in pbar)
+        return loss / len(dataset)
 
 
 class CollateFn:
@@ -366,20 +363,36 @@ class Trainer:
 
 def main() -> None:
 
+    SPLIT_GROUPS = True
+    SUBSET = False
+    BASAL_LOSS = False
+
     ipd_groups = []
     for group in load_data():
         ipd_groups.append([ipds.tolist() for ipds in group])
     print(f"Collected {sum(len(group) for group in ipd_groups)} IPDs from {len(ipd_groups)} groups.")
     print("-" * 80)
 
-    dataset = ApproximatorDataset(ipd_groups)
-    tr_dataset, vl_dataset = random_split(dataset, [0.85, 0.15])
-    # print(f"Training Dataset: {tr_dataset.dataset}")
-    # print(f"Validation Dataset: {vl_dataset.dataset}")
-    # print("-" * 80)
+    if SPLIT_GROUPS:
+        tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
+        tr_dataset = ApproximatorDataset(tr_ipd_groups)
+        vl_dataset = ApproximatorDataset(vl_ipd_groups)
+    else:
+        dataset = ApproximatorDataset(ipd_groups)
+        tr_dataset, vl_dataset = random_split(dataset, [0.85, 0.15])
 
-    tr_dataset = Subset(tr_dataset, list(range(4096)))  # FIXME
-    vl_dataset = Subset(vl_dataset, list(range(4096)))  # FIXME
+    if SUBSET:
+        tr_dataset = Subset(tr_dataset, list(range(4096)))
+        vl_dataset = Subset(vl_dataset, list(range(4096)))
+
+    if BASAL_LOSS:
+        loss = ApproximatorDataset.compute_basal_loss(ApproximatorDataset(ipd_groups))
+        print(f"Dataset Basal Loss: {loss}")
+    print(f"Training Dataset: {tr_dataset.dataset}")
+    print(f"Validation Dataset: {vl_dataset.dataset}")
+    print("-" * 80)
+
+    print()
 
     model = TransformerApproximator(
         hidden_size=256,
