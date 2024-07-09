@@ -55,6 +55,7 @@ def get_body(
     --batch_size=1024 \\
     --learning_rate=1e-4 \\
     --dataloader_num_workers=4 \\
+    --dynamic \\
     {'--demo \\' if args.demo else 'REMOVE'}
     --device={'cuda:0' if args.device >= 0 else 'cpu'} > {logfile} 2>&1
     """.replace("    ", "").replace("REMOVE\n", "")
@@ -67,7 +68,7 @@ runfiles = []
 
 for tr_num_samples in (200000, 500000):
     for fingerprint_length in (512, 1024, 2048, 4096, 8192, 16384):
-        jobname = f"E1--{tr_num_samples}--{fingerprint_length}"
+        jobname = f"E1-1--{tr_num_samples}--{fingerprint_length}"
         logfile = f"./logs/{jobname}.log"
         outdir = f"./output/{jobname}"
         runfile = f"./run/{jobname}.sh"
@@ -92,7 +93,7 @@ for tr_num_samples in (200000, 500000):
 
 for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3), (20e-3, 30e-3)):
     for amplitude in (5e-3, 10e-3, 20e-3, 30e-3, 40e-3):
-        jobname = f"E2--{noise_deviation_low}--{noise_deviation_high}--{amplitude}"
+        jobname = f"E2-1--{noise_deviation_low}--{noise_deviation_high}--{amplitude}"
         logfile = f"./logs/{jobname}.log"
         outdir = f"./output/{jobname}"
         runfile = f"./run/{jobname}.sh"
@@ -118,7 +119,7 @@ for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3),
 for tr_num_samples in (200000, 500000):
     for num_train_epochs in (100, 200):
         for flow_length in (50, 100, 150):
-            jobname = f"E3--{tr_num_samples}--{num_train_epochs}--{flow_length}"
+            jobname = f"E3-1--{tr_num_samples}--{num_train_epochs}--{flow_length}"
             logfile = f"./logs/{jobname}.log"
             outdir = f"./output/{jobname}"
             runfile = f"./run/{jobname}.sh"
