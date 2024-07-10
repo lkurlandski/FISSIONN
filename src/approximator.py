@@ -5,11 +5,13 @@ TODO:
 """
 
 from __future__ import annotations
+from argparse import ArgumentParser
 from collections.abc import Iterable
 from itertools import chain, combinations
 import json
 import os
 from pathlib import Path
+from pprint import pformat, pprint
 import shutil
 import sys
 import time
@@ -29,7 +31,11 @@ if __name__ == "__main__":
 
 from src.data import load_data
 from src.finn import ShapeError
-from src.utils import count_parameters
+from src.utils import (
+    count_parameters,
+    seed_everything,
+    ShapeError,
+)
 # pylint: enable=wrong-import-position
 
 
@@ -261,8 +267,7 @@ class Trainer:
 
     def __call__(self) -> None:
         if self.args.outdir.exists():
-            shutil.rmtree(self.args.outdir)
-            # raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
+            raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
         self.args.outdir.mkdir(parents=True, exist_ok=True)
 
         tr_metrics = {"tr_loss": float("nan")}
@@ -363,9 +368,22 @@ class Trainer:
 
 def main() -> None:
 
-    SPLIT_GROUPS = True
-    SUBSET = False
-    BASAL_LOSS = False
+    parser = ArgumentParser()
+    parser.add_argument("--no_split_groups", action="store_true")
+    parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
+    parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
+    parser.add_argument("--compute_basal_loss", action="store_true")
+    parser.add_argument("--seed", type=int, default=0, help=".")
+    parser.add_argument("--outdir", type=Path, default=Path("./output/tmp.jsonl"), help=".")
+    args = parser.parse_args()
+
+    print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
+    print("-" * 80)
+
+    if args.outdir.exists():
+        raise FileExistsError(f"Output Directory Already Exists: {args.outdir}")
+
+    seed_everything(args.seed)
 
     ipd_groups = []
     for group in load_data():
@@ -373,39 +391,41 @@ def main() -> None:
     print(f"Collected {sum(len(group) for group in ipd_groups)} IPDs from {len(ipd_groups)} groups.")
     print("-" * 80)
 
-    if SPLIT_GROUPS:
+    if args.no_split_groups:
+        dataset = ApproximatorDataset(ipd_groups)
+        tr_dataset, vl_dataset = random_split(dataset, [0.85, 0.15])
+    else:
         tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
         tr_dataset = ApproximatorDataset(tr_ipd_groups)
         vl_dataset = ApproximatorDataset(vl_ipd_groups)
-    else:
-        dataset = ApproximatorDataset(ipd_groups)
-        tr_dataset, vl_dataset = random_split(dataset, [0.85, 0.15])
 
-    if SUBSET:
-        tr_dataset = Subset(tr_dataset, list(range(4096)))
-        vl_dataset = Subset(vl_dataset, list(range(4096)))
+    if args.tr_num_samples < len(tr_dataset):
+        tr_dataset = Subset(tr_dataset, list(range(args.tr_num_samples)))
+    if args.vl_num_samples < len(vl_dataset):
+        vl_dataset = Subset(vl_dataset, list(range(args.vl_num_samples)))
 
-    if BASAL_LOSS:
+    if args.compute_basal_loss:
         loss = ApproximatorDataset.compute_basal_loss(ApproximatorDataset(ipd_groups))
         print(f"Dataset Basal Loss: {loss}")
-    print(f"Training Dataset: {tr_dataset.dataset}")
-    print(f"Validation Dataset: {vl_dataset.dataset}")
+
+    print(f"Training Dataset: {tr_dataset}")
+    print(f"Validation Dataset: {vl_dataset}")
     print("-" * 80)
 
     print()
 
-    model = TransformerApproximator(
-        hidden_size=256,
-        num_layers=6,
-        nhead=4,
-        intermediate_size=1024,
-    )
+    # model = TransformerApproximator(
+    #     hidden_size=256,
+    #     num_layers=6,
+    #     nhead=4,
+    #     intermediate_size=1024,
+    # )
 
     model = RecurrentApproximator(
         hidden_size=256,
         num_layers=6,
         bidirectional=True,
-        cell=nn.LSTM,
+        cell=nn.GRU,
     )
 
     print(f"Model:\n{model}")
@@ -420,9 +440,9 @@ def main() -> None:
 
     training_arguments = TrainerArgs(
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        outdir=Path("output/approximator"),
+        outdir=args.outdir,
         num_train_epochs=1000,
-        batch_size=64,
+        batch_size=256,
         logging_steps=-1,
         disable_tqdm=False,
         dataloader_num_workers=4,
