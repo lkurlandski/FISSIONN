@@ -30,9 +30,13 @@ class FINNTrainerAnalyzer:
             raise ValueError("No data found in log file.")
 
         self.data = {key: [] for key in self.log[0].keys()}
+        for k in self.log[1].keys():  # FIXME: remove
+            if k not in self.data:
+                self.data[k] = [np.NaN]
         for d in self.log:
             for k, v in d.items():
                 self.data[k].append(v)
+            
         self.data = {k: np.array(v) for k, v in self.data.items()}
 
         return self
@@ -46,7 +50,7 @@ class FINNTrainerAnalyzer:
             fig.savefig(self.outdir / f"{k}.png")
             plt.close(fig)
 
-        fig, _ = self._plot(["tr_weighted_loss", "vl_weighted_loss", "vl_extraction_rate", "vl_bit_error_rate"])
+        fig, _ = self._plot(["tr_loss", "vl_loss", "vl_extraction_rate", "vl_bit_error_rate"])
         fig.savefig(self.outdir / "main.png")
         plt.close(fig)
 
@@ -72,7 +76,19 @@ class FINNTrainerAnalyzer:
         return fig, ax
 
 
+def main() -> None:
+    # analyzer = FINNTrainerAnalyzer("output/E1-0--200000--16384")
+    # analyzer()
+    # analyzer.plot()
+
+    # analyzer = FINNTrainerAnalyzer("output/E1-1--200000--16384")
+    # analyzer()
+    # analyzer.plot()
+
+    analyzer = FINNTrainerAnalyzer("output/E1-2--200000--16384")
+    analyzer()
+    analyzer.plot()
+
+
 if __name__ == "__main__":
-    for outdir in sorted((p for p in Path("./output").iterdir() if p.is_dir())):
-        analyzer = FINNTrainerAnalyzer(outdir)
-        analyzer = analyzer()
+    main()

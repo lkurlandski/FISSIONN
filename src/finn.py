@@ -23,8 +23,7 @@ import json
 import math
 import os
 from pathlib import Path
-from pprint import pformat, pprint
-import random
+from pprint import pformat
 import sys
 import time
 from typing import Literal, Optional
@@ -34,7 +33,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 import torch
 from torch import nn, Tensor
-from torch.distributions import Laplace, Uniform, Normal
+from torch.distributions import Laplace, Uniform
 from torch.nn import functional as F, CrossEntropyLoss, L1Loss
 from torch.optim import Optimizer, Adam
 from torch.nn.utils.rnn import pad_sequence
@@ -51,23 +50,15 @@ from src.caida import (
     get_caida_ipds,
     CaidaSample,  # pylint: disable=unused-import  # Needed because of pickle
 )
-from src.utils import count_parameters, one_hot_to_binary, tensor_memory_size
+from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser
+from src.utils import (
+    count_parameters,
+    one_hot_to_binary,
+    tensor_memory_size,
+    seed_everything,
+    ShapeError,
+)
 # pylint: enable=wrong-import-position
-
-
-class ShapeError(ValueError):
-
-    def __init__(self, actual_shape: tuple, expected_shape: Optional[tuple] = None):
-        self.expected_shape = tuple(expected_shape)
-        self.actual_shape = tuple(actual_shape) if actual_shape else None
-        super().__init__(f"Recieved: {self.actual_shape}. Expected: {self.expected_shape}")
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 class FINNDataset(Dataset, ABC):
@@ -132,7 +123,7 @@ class FINNDataset(Dataset, ABC):
         s += f"  delay_sampler={self.delay_sampler},\n"
         s += f"  noise_sampler_sampler={self.noise_sampler_sampler},\n"
         s += f"  memory_size={round(self.memory_size / 1e9, 2)}G,\n"
-        s += f")"
+        s += ")"
         return s
 
     def __str__(self) -> str:
@@ -243,14 +234,12 @@ class FINNCollateFn:
         flow_length: int,
         paddding: Optional[Literal["long", "max"]] = None,
         truncate: bool = False,
-        pad_to: int = 1,
         pad_value: int = 0,
     ) -> None:
         self.fingerprint_length = fingerprint_length
         self.flow_length = flow_length
         self.padding = paddding
         self.truncate = truncate
-        self.pad_to = pad_to
         self.pad_value = pad_value
 
     def __call__(self, batch: list[tuple[Tensor, Tensor, Tensor, Tensor]]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -280,7 +269,7 @@ class FINNCollateFn:
         raise ValueError(f"Invalid padding option: {self.padding}")
 
 
-class FINNLoss(nn.Module):
+class FINNLossFn(nn.Module):
 
     def __init__(
         self,
@@ -468,169 +457,67 @@ class FINNModel(nn.Module):
         return ipd + torch.cumsum(delay, dim=1) + torch.cumsum(noise, dim=1)
 
 
-@dataclass
-class FINNTrainerArgs:
-    outdir: Path
-    num_train_epochs: int = 1
-    batch_size: int = 1
-    dataloader_num_workers: int = 0
-    device: torch.cuda.device = torch.device("cpu")
-    disable_tqdm: bool = False
-    logging_steps: int = -1
+class FINNTrainer(Trainer):
 
+    model: FINNModel
+    tr_dataset: FINNDataset
+    vl_dataset: FINNDataset
+    collate_fn: FINNCollateFn
+    loss_fn: FINNLossFn
+    tr_metric_keys = ("tr_loss", "tr_enc_loss", "tr_dec_loss", "tr_time",)
+    vl_metric_keys = ("vl_loss", "vl_enc_loss", "vl_dec_loss", "vl_bit_error_rate", "vl_extraction_rate", "vl_time",)
 
-class FINNTrainer:
+    def train_one_batch(self, batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> dict[str, float]:
 
-    def __init__(
-        self,
-        args: FINNTrainerArgs,
-        model: FINNModel,
-        tr_dataset: FINNDataset,
-        vl_dataset: FINNDataset,
-        collate_fn: FINNCollateFn,
-        loss_fn: FINNLoss,
-        optimizer: Optimizer,
-    ) -> None:
-        self.args = args
-        self.model = model
-        self.model.to(self.args.device)
-        self.tr_dataset = tr_dataset
-        self.vl_dataset = vl_dataset
-        self.collate_fn = collate_fn
-        self.loss_fn = loss_fn
-        self.optimizer = optimizer
-        self.log = []
+        fingerprint: Tensor = batch[0].to(self.args.device)
+        ipd: Tensor = batch[1].to(self.args.device)
+        delay: Tensor = batch[2].to(self.args.device)
+        noise: Tensor = batch[3].to(self.args.device)
 
-    def __call__(self) -> None:
-        if self.args.outdir.exists():
-            raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
-        self.args.outdir.mkdir(parents=True, exist_ok=True)
+        self.model.zero_grad()
+        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
+        weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
+        weighted_loss.backward()
+        self.optimizer.step()
 
-        tr_metrics = {"tr_weighted_loss": float("nan"), "tr_encoder_loss": float("nan"), "tr_decoder_loss": float("nan")}
-        vl_metrics = self.evaluate()
-        d = {"epoch": 0} | tr_metrics | vl_metrics
-        self.log.append(d)
-        print(self._fmt_dict(d))
-
-        pbar = self._get_pbar(range(1, self.args.num_train_epochs + 1), desc="Epochs")
-        for epoch in pbar:
-            tr_metrics = self.train()
-            vl_metrics = self.evaluate()
-            d = {"epoch": epoch} | tr_metrics | vl_metrics
-            self.log.append(d)
-            print(self._fmt_dict(d))
-            with open(self.args.outdir / "results.jsonl", "a") as fp:
-                fp.write(json.dumps(d) + "\n")
-
-    def _get_pbar(self, iterable: Iterable, **kwds) -> tqdm | Iterable:
-        if self.args.disable_tqdm:
-            return iterable
-        return tqdm(iterable, **kwds)
-
-    def _fmt_dict(self, d: dict[str, float]) -> dict[str, str]:
-        return {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
-
-    def train(self) -> dict[str, float]:
-        t_0 = time.time()
-        self.model.train()
-        cum_samples, cum_weighted_loss, cum_encoder_loss, cum_decoder_loss = 0, 0, 0, 0
-        log_samples, log_weighted_loss, log_encoder_loss, log_decoder_loss = 0, 0, 0, 0
-        dataloader = self.get_dataloader(self.tr_dataset, shuffle=True)
-        pbar = self._get_pbar(dataloader, total=len(self.tr_dataset) // self.args.batch_size)
-        for i, batch in enumerate(pbar):
-
-            fingerprint: Tensor = batch[0].to(self.args.device)
-            ipd: Tensor = batch[1].to(self.args.device)
-            delay: Tensor = batch[2].to(self.args.device)
-            noise: Tensor = batch[3].to(self.args.device)
-
-            self.model.zero_grad()
-            delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
-            weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
-            weighted_loss.backward()
-            self.optimizer.step()
-
-            cum_samples += fingerprint.size(0)
-            cum_weighted_loss += weighted_loss.item()
-            cum_encoder_loss += encoder_loss.item()
-            cum_decoder_loss += decoder_loss.item()
-
-            log_samples += fingerprint.size(0)
-            log_weighted_loss += weighted_loss.item()
-            log_encoder_loss += encoder_loss.item()
-            log_decoder_loss += decoder_loss.item()
-
-            if self.args.logging_steps > 0 and i % self.args.logging_steps == 0:
-                d = {
-                    "log_weighted_loss": log_weighted_loss / log_samples,
-                    "log_encoder_loss": log_encoder_loss / log_samples,
-                    "log_decoder_loss": log_decoder_loss / log_samples,
-                }
-                d = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in d.items()}
-                log_samples, log_weighted_loss, log_encoder_loss, log_decoder_loss = 0, 0, 0, 0
-                print(d)
-
-        d = {
-            "tr_weighted_loss": cum_weighted_loss / cum_samples,
-            "tr_encoder_loss": cum_encoder_loss / cum_samples,
-            "tr_decoder_loss": cum_decoder_loss / cum_samples,
-            "tr_time": time.time() - t_0,
+        return {
+            "tr_loss": weighted_loss.item(),
+            "tr_enc_loss": encoder_loss.item(),
+            "tr_dec_loss": decoder_loss.item(),
         }
 
-        return d
+    def evaluate_one_batch(self, batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> dict[str, float]:
 
-    def evaluate(self) -> dict[str, float]:
-        t_0 = time.time()
-        self.model.eval()
-        cum_samples, cum_weighted_loss, cum_encoder_loss, cum_decoder_loss = 0, 0, 0, 0
-        bit_error_rates, y_true, y_pred = 0, [], []
-        dataloader = self.get_dataloader(self.vl_dataset, shuffle=False)
-        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
-        for batch in pbar:
+        fingerprint: Tensor = batch[0].to(self.args.device)
+        ipd: Tensor = batch[1].to(self.args.device)
+        delay: Tensor = batch[2].to(self.args.device)
+        noise: Tensor = batch[3].to(self.args.device)
 
-            fingerprint: Tensor = batch[0].to(self.args.device)
-            ipd: Tensor = batch[1].to(self.args.device)
-            delay: Tensor = batch[2].to(self.args.device)
-            noise: Tensor = batch[3].to(self.args.device)
+        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
+        weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
+        predictions = F.softmax(fingerprint_pred, dim=-1)
 
-            delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
-            weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
-            predictions = F.softmax(fingerprint_pred, dim=-1)
+        # Compute the bit-error rate.
+        one_hot_predictions = torch.zeros_like(predictions)
+        one_hot_predictions[torch.arange(len(predictions)), torch.argmax(predictions, dim=1)] = 1
+        binary_fingerprint = one_hot_to_binary(fingerprint).to(bool)
+        binary_predictions = one_hot_to_binary(one_hot_predictions).to(bool)
+        bit_difference: Tensor = binary_fingerprint ^ binary_predictions
+        bit_errors = bit_difference.sum() / math.log2(fingerprint.size(1))
+        bit_error_rate = bit_errors / fingerprint.size(0)
 
-            one_hot_predictions = torch.zeros_like(predictions)
-            one_hot_predictions[torch.arange(len(predictions)), torch.argmax(predictions, dim=1)] = 1
-            binary_fingerprint = one_hot_to_binary(fingerprint).to(bool)
-            binary_predictions = one_hot_to_binary(one_hot_predictions).to(bool)
-            bit_difference = binary_fingerprint ^ binary_predictions
-            bit_error_rates += (bit_difference.sum().item() / math.log2(fingerprint.size(1)))
+        # Compute the extraction rate.
+        y_true = torch.argmax(fingerprint, dim=1).tolist()
+        y_pred = torch.argmax(predictions, dim=1).tolist()
+        accuracy = accuracy_score(y_true, y_pred)
 
-            cum_samples += fingerprint.size(0)
-            cum_weighted_loss += weighted_loss.item()
-            cum_encoder_loss += encoder_loss.item()
-            cum_decoder_loss += decoder_loss.item()
-
-            y_true.extend(torch.argmax(fingerprint, dim=1).tolist())
-            y_pred.extend(torch.argmax(predictions, dim=1).tolist())
-
-        d = {
-            "vl_weighted_loss": cum_weighted_loss / cum_samples,
-            "vl_encoder_loss": cum_encoder_loss / cum_samples,
-            "vl_decoder_loss": cum_decoder_loss / cum_samples,
-            "vl_bit_error_rate": bit_error_rates / cum_samples,
-            "vl_extraction_rate": accuracy_score(y_true, y_pred),
-            "vl_time": time.time() - t_0,
+        return {
+            "vl_loss": weighted_loss.item(),
+            "vl_enc_loss": encoder_loss.item(),
+            "vl_dec_loss": decoder_loss.item(),
+            "vl_bit_error_rate": bit_error_rate.item(),
+            "vl_extraction_rate": accuracy,
         }
-
-        return d
-
-    def get_dataloader(self, dataset: FINNDataset, shuffle: bool = False) -> None:
-        return DataLoader(
-            dataset,
-            self.args.batch_size,
-            shuffle,
-            num_workers=self.args.dataloader_num_workers,
-            collate_fn=self.collate_fn,
-        )
 
 
 def main():
@@ -638,7 +525,7 @@ def main():
     print(f"STARTING {datetime.now().isoformat()}")
     print("-" * 80)
 
-    parser = ArgumentParser(formatter_class=type("F", (ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter), {}))
+    parser = TrainerArgumentParser(formatter_class=type("F", (ArgumentDefaultsHelpFormatter, MetavarTypeHelpFormatter), {}))
     parser.add_argument("--fingerprint_length", type=int, default=512, help=".")
     parser.add_argument("--flow_length", type=int, default=150, help=".")
     parser.add_argument("--min_flow_length", type=int, default=150, help=".")
@@ -651,14 +538,6 @@ def main():
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--outdir", type=Path, default=Path("./output/tmp.jsonl"), help=".")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help=".")
-    parser.add_argument("--batch_size", type=int, default=2, help=".")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help=".")
-    parser.add_argument("--dataloader_num_workers", type=int, default=0, help=".")
-    parser.add_argument("--device", type=torch.device, default="cpu", help=".")
-    parser.add_argument("--disable_tqdm", action="store_true", help=".")
-    parser.add_argument("--logging_steps", type=int, default=-1, help=".")
     parser.add_argument("--dynamic", action="store_true", help=".")
     parser.add_argument("--use_same_dataset", action="store_true", help=".")
     parser.add_argument("--demo", action="store_true", help=".")
@@ -667,7 +546,7 @@ def main():
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
     print("-" * 80)
 
-    if args.outdir.exists():
+    if args.outdir.exists() and args.outdir.name not in Trainer.OVERWRITE_OUTDIRS:
         raise FileExistsError(f"Output Directory Already Exists: {args.outdir}")
 
     seed_everything(args.seed)
@@ -713,19 +592,20 @@ def main():
     print(f"Decoder Parameters: {round(count_parameters(model.decoder) / 1e6, 2)}M")
     print("-" * 80)
 
-    training_arguments = FINNTrainerArgs(
+    trainer_args = TrainerArgs(
         outdir=args.outdir,
-        num_train_epochs=args.num_train_epochs,
-        batch_size=args.batch_size,
-        dataloader_num_workers=args.dataloader_num_workers,
         device=args.device,
+        epochs=args.epochs,
+        tr_batch_size=args.tr_batch_size,
+        vl_batch_size=args.vl_batch_size,
+        learning_rate=args.learning_rate,
+        num_workers=args.num_workers,
         disable_tqdm=args.disable_tqdm,
         logging_steps=args.logging_steps,
     )
     collate_fn = FINNCollateFn(args.fingerprint_length, args.flow_length, "max", truncate=True)
-    loss_fn = FINNLoss(encoder_weight=args.encoder_loss_weight, decoder_weight=args.decoder_loss_weight)
-    optimizer = Adam(model.parameters(), lr=args.learning_rate)
-    trainer = FINNTrainer(training_arguments, model, tr_dataset, vl_dataset, collate_fn, loss_fn, optimizer)
+    loss_fn = FINNLossFn(encoder_weight=args.encoder_loss_weight, decoder_weight=args.decoder_loss_weight)
+    trainer = FINNTrainer(trainer_args, model, tr_dataset, vl_dataset, collate_fn, loss_fn)
 
     trainer()
 

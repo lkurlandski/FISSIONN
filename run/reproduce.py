@@ -13,6 +13,7 @@ import sys
 
 
 parser = ArgumentParser()
+parser.add_argument("--iteration", type=int, required=True)
 parser.add_argument("--device", type=int, default=0, help="-1, 0, 1, etc. for CPU, GPU, etc.")
 parser.add_argument("--demo", action="store_true", help="Run demo experiments")
 args = parser.parse_args()
@@ -26,7 +27,7 @@ def get_body(
     noise_deviation_high: float,
     tr_num_samples: int,
     vl_num_samples: int,
-    num_train_epochs: int,
+    epochs: int,
     outdir: str,
     logfile: str,
 ) -> str:
@@ -51,15 +52,18 @@ def get_body(
     --vl_num_samples={vl_num_samples} \\
     --seed=0 \\
     --outdir={outdir} \\
-    --num_train_epochs={num_train_epochs} \\
-    --batch_size=1024 \\
+    --epochs={epochs} \\
+    --tr_batch_size=1024 \\
+    --vl_batch_size=4096 \\
     --learning_rate=1e-4 \\
-    --dataloader_num_workers=4 \\
-    --dynamic \\
+    --num_workers=4 \\
     {'--demo \\' if args.demo else 'REMOVE'}
     --device={'cuda:0' if args.device >= 0 else 'cpu'} > {logfile} 2>&1
     """.replace("    ", "").replace("REMOVE\n", "")
 
+
+for f in Path("./run").glob("*.sh"):
+    f.unlink()
 
 runfiles = []
 
@@ -68,7 +72,7 @@ runfiles = []
 
 for tr_num_samples in (200000, 500000):
     for fingerprint_length in (512, 1024, 2048, 4096, 8192, 16384):
-        jobname = f"E1-1--{tr_num_samples}--{fingerprint_length}"
+        jobname = f"E1-{args.iteration}--{tr_num_samples}--{fingerprint_length}"
         logfile = f"./logs/{jobname}.log"
         outdir = f"./output/{jobname}"
         runfile = f"./run/{jobname}.sh"
@@ -80,7 +84,7 @@ for tr_num_samples in (200000, 500000):
             noise_deviation_high=10e-3,
             tr_num_samples=tr_num_samples,
             vl_num_samples=50000,
-            num_train_epochs=100,
+            epochs=100,
             outdir=outdir,
             logfile=logfile,
         )
@@ -93,7 +97,7 @@ for tr_num_samples in (200000, 500000):
 
 for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3), (20e-3, 30e-3)):
     for amplitude in (5e-3, 10e-3, 20e-3, 30e-3, 40e-3):
-        jobname = f"E2-1--{noise_deviation_low}--{noise_deviation_high}--{amplitude}"
+        jobname = f"E2-{args.iteration}--{noise_deviation_low}--{noise_deviation_high}--{amplitude}"
         logfile = f"./logs/{jobname}.log"
         outdir = f"./output/{jobname}"
         runfile = f"./run/{jobname}.sh"
@@ -105,7 +109,7 @@ for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3),
             noise_deviation_high=noise_deviation_high,
             tr_num_samples=200000,
             vl_num_samples=50000,
-            num_train_epochs=100,
+            epochs=100,
             outdir=outdir,
             logfile=logfile,
         )
@@ -117,9 +121,9 @@ for noise_deviation_low, noise_deviation_high in ((2e-3, 10e-3), (10e-3, 20e-3),
 # Experiment 3: Impact of Flow Length
 
 for tr_num_samples in (200000, 500000):
-    for num_train_epochs in (100, 200):
+    for epochs in (100, 200):
         for flow_length in (50, 100, 150):
-            jobname = f"E3-1--{tr_num_samples}--{num_train_epochs}--{flow_length}"
+            jobname = f"E3-{args.iteration}--{tr_num_samples}--{epochs}--{flow_length}"
             logfile = f"./logs/{jobname}.log"
             outdir = f"./output/{jobname}"
             runfile = f"./run/{jobname}.sh"
@@ -131,35 +135,13 @@ for tr_num_samples in (200000, 500000):
                 noise_deviation_high=10e-3,
                 tr_num_samples=tr_num_samples,
                 vl_num_samples=50000,
-                num_train_epochs=num_train_epochs,
+                epochs=epochs,
                 outdir=outdir,
                 logfile=logfile,
             )
             with open(runfile, "w") as f:
                 f.write(body + "\n")
             runfiles.append(runfile)
-
-
-# Test the largest configuration.
-
-jobname = f"test"
-logfile = f"./logs/{jobname}.log"
-outdir = f"./output/{jobname}"
-runfile = f"./run/{jobname}.sh"
-body = get_body(
-    fingerprint_length=16384,
-    flow_length=150,
-    amplitude=40e-3,
-    noise_deviation_low=2e-3,
-    noise_deviation_high=10e-3,
-    tr_num_samples=100000,
-    vl_num_samples=10000,
-    num_train_epochs=1,
-    outdir=outdir,
-    logfile=logfile,
-)
-with open(runfile, "w") as f:
-    f.write(body + "\n")
 
 
 # Convienient run script.

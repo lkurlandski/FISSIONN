@@ -1,28 +1,19 @@
 """
-
-TODO:
- - The train and test split should be formed from distinct groups!
+A network to approximate the noising process of IPDs through SSI chains.
 """
 
 from __future__ import annotations
-from argparse import ArgumentParser
-from collections.abc import Iterable
 from itertools import chain, combinations
-import json
 import os
-from pathlib import Path
-from pprint import pformat, pprint
-import shutil
+from pprint import pformat
 import sys
-import time
 from typing import Optional
 
 from sklearn.model_selection import train_test_split
 import torch
 from torch import nn, Tensor
-from torch.optim import Optimizer, AdamW
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader, random_split, Subset
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
 # pylint: disable=wrong-import-position
@@ -30,7 +21,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_data
-from src.finn import ShapeError
+from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser
 from src.utils import (
     count_parameters,
     seed_everything,
@@ -68,7 +59,7 @@ class ApproximatorDataset(Dataset):
 
     @staticmethod
     def compute_basal_loss(dataset: ApproximatorDataset) -> float:
-        collate_fn = CollateFn(max_length=256)
+        collate_fn = ApproximatorCollateFn(max_length=256)
         loss_fn = ApproximatorLossFn(pad_to_same_length=True)
         dataloader = DataLoader(dataset, batch_size=1024, collate_fn=collate_fn)
         pbar = tqdm(dataloader, desc="Computing Basal Loss...")
@@ -76,7 +67,7 @@ class ApproximatorDataset(Dataset):
         return loss / len(dataset)
 
 
-class CollateFn:
+class ApproximatorCollateFn:
 
     def __init__(
         self,
@@ -102,7 +93,7 @@ class ApproximatorLossFn(nn.Module):
         super().__init__()
         self.pad_to_same_length = pad_to_same_length
         self.trim_to_same_length = trim_to_same_length
-        self.loss_fn = nn.MSELoss(reduction="sum")
+        self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         if y_pred.size(1) != y_true.size(1):
@@ -233,154 +224,47 @@ class TransformerApproximator(nn.Module):
         return y_pred
 
 
-class TrainerArgs:
-    def __init__(self, device: torch.device, outdir: Path, num_train_epochs: int, batch_size: int, logging_steps: int, disable_tqdm: bool, dataloader_num_workers: int):
-        self.device = device
-        self.outdir = outdir
-        self.num_train_epochs = num_train_epochs
-        self.batch_size = batch_size
-        self.logging_steps = logging_steps
-        self.disable_tqdm = disable_tqdm
-        self.dataloader_num_workers = dataloader_num_workers
+class ApproximatorTrainer(Trainer):
 
+    model: RecurrentApproximator | TransformerApproximator
+    tr_dataset: ApproximatorDataset
+    vl_dataset: ApproximatorDataset
+    collate_fn: ApproximatorCollateFn
+    loss_fn: ApproximatorLossFn
 
-class Trainer:
-    def __init__(
-        self,
-        args: TrainerArgs,
-        model: TransformerApproximator | RecurrentApproximator,
-        tr_dataset: Dataset,
-        vl_dataset: Dataset,
-        collate_fn: CollateFn,
-        loss_fn: ApproximatorLossFn,
-        optimizer: Optimizer,
-    ) -> None:
-        self.args = args
-        self.model = model
-        self.model.to(self.args.device)
-        self.tr_dataset = tr_dataset
-        self.vl_dataset = vl_dataset
-        self.collate_fn = collate_fn
-        self.loss_fn = loss_fn
-        self.optimizer = optimizer
-        self.log = []
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> dict[str, float]:
 
-    def __call__(self) -> None:
-        if self.args.outdir.exists():
-            raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
-        self.args.outdir.mkdir(parents=True, exist_ok=True)
+        x: Tensor = batch[0].to(self.args.device)
+        y: Tensor = batch[1].to(self.args.device)
 
-        tr_metrics = {"tr_loss": float("nan")}
-        vl_metrics = self.evaluate()
-        d = {"epoch": 0} | tr_metrics | vl_metrics
-        self.log.append(d)
-        print(self._fmt_dict(d))
+        self.model.zero_grad()
+        y_pred = self.model.forward(x, y)
+        loss: Tensor = self.loss_fn.forward(y_pred, y)
+        loss.backward()
+        self.optimizer.step()
 
-        pbar = self._get_pbar(range(1, self.args.num_train_epochs + 1), desc="Epochs")
-        for epoch in pbar:
-            tr_metrics = self.train()
-            vl_metrics = self.evaluate()
-            d = {"epoch": epoch} | tr_metrics | vl_metrics
-            self.log.append(d)
-            print(self._fmt_dict(d))
-            with open(self.args.outdir / "results.jsonl", "a") as fp:
-                fp.write(json.dumps(d) + "\n")
+        return {"tr_loss": loss.item()}
 
-    def _get_pbar(self, iterable: Iterable, **kwds) -> tqdm | Iterable:
-        if self.args.disable_tqdm:
-            return iterable
-        return tqdm(iterable, **kwds)
+    def evaluate_one_batch(self, batch: tuple[Tensor, Tensor]) -> dict[str, float]:
+        x: Tensor = batch[0].to(self.args.device)
+        y: Tensor = batch[1].to(self.args.device)
 
-    def _fmt_dict(self, d: dict[str, float]) -> dict[str, str]:
-        return {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in d.items()}
+        y_pred = self.model.forward(x, y)
+        loss = self.loss_fn.forward(y_pred, y)
 
-    def train(self) -> dict[str, float]:
-        t_0 = time.time()
-        self.model.train()
-        cum_samples, cum_loss = 0, 0
-        log_samples, log_loss = 0, 0
-        dataloader = self.get_dataloader(self.tr_dataset, shuffle=True)
-        pbar = self._get_pbar(dataloader, total=len(self.tr_dataset) // self.args.batch_size)
-        for i, batch in enumerate(pbar):
-            x: Tensor = batch[0].to(self.args.device)
-            y: Tensor = batch[1].to(self.args.device)
-
-            self.model.zero_grad()
-            y_pred = self.model.forward(x, y)
-            loss = self.loss_fn.forward(y_pred, y)
-            loss.backward()
-            self.optimizer.step()
-
-            cum_samples += x.size(0)
-            cum_loss += loss.item()
-
-            log_samples += x.size(0)
-            log_loss += loss.item()
-
-            if self.args.logging_steps > 0 and i % self.args.logging_steps == 0:
-                d = {
-                    "log_loss": log_loss / log_samples,
-                }
-                d = {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in d.items()}
-                log_samples, log_loss = 0, 0
-                print(d)
-
-        d = {
-            "tr_loss": cum_loss / cum_samples,
-            "tr_time": time.time() - t_0,
-        }
-
-        return d
-
-    def evaluate(self) -> dict[str, float]:
-        t_0 = time.time()
-        self.model.eval()
-        cum_samples, cum_loss = 0, 0
-        dataloader = self.get_dataloader(self.vl_dataset, shuffle=False)
-        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.batch_size)
-        with torch.no_grad():
-            for batch in pbar:
-                x: Tensor = batch[0].to(self.args.device)
-                y: Tensor = batch[1].to(self.args.device)
-
-                y_pred = self.model.forward(x, y)
-                loss = self.loss_fn.forward(y_pred, y)
-
-                cum_samples += x.size(0)
-                cum_loss += loss.item()
-
-        d = {
-            "vl_loss": cum_loss / cum_samples,
-            "vl_time": time.time() - t_0,
-        }
-
-        return d
-
-    def get_dataloader(self, dataset: Dataset, shuffle: bool = False) -> DataLoader:
-        return DataLoader(
-            dataset,
-            self.args.batch_size,
-            shuffle,
-            num_workers=self.args.dataloader_num_workers,
-            collate_fn=self.collate_fn,
-        )
+        return {"vl_loss": loss.item()}
 
 
 def main() -> None:
 
-    parser = ArgumentParser()
-    parser.add_argument("--no_split_groups", action="store_true")
-    parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
-    parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
-    parser.add_argument("--compute_basal_loss", action="store_true")
+    parser = TrainerArgumentParser()
     parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--outdir", type=Path, default=Path("./output/tmp.jsonl"), help=".")
     args = parser.parse_args()
 
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
     print("-" * 80)
 
-    if args.outdir.exists():
+    if args.outdir.exists() and args.outdir.name not in Trainer.OVERWRITE_OUTDIRS:
         raise FileExistsError(f"Output Directory Already Exists: {args.outdir}")
 
     seed_everything(args.seed)
@@ -391,42 +275,33 @@ def main() -> None:
     print(f"Collected {sum(len(group) for group in ipd_groups)} IPDs from {len(ipd_groups)} groups.")
     print("-" * 80)
 
-    if args.no_split_groups:
-        dataset = ApproximatorDataset(ipd_groups)
-        tr_dataset, vl_dataset = random_split(dataset, [0.85, 0.15])
-    else:
-        tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
-        tr_dataset = ApproximatorDataset(tr_ipd_groups)
-        vl_dataset = ApproximatorDataset(vl_ipd_groups)
+    tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
+    tr_dataset = ApproximatorDataset(tr_ipd_groups)
+    vl_dataset = ApproximatorDataset(vl_ipd_groups)
 
-    if args.tr_num_samples < len(tr_dataset):
-        tr_dataset = Subset(tr_dataset, list(range(args.tr_num_samples)))
-    if args.vl_num_samples < len(vl_dataset):
-        vl_dataset = Subset(vl_dataset, list(range(args.vl_num_samples)))
+    # tr_dataset = Subset(tr_dataset, range(4096))
+    # vl_dataset = Subset(vl_dataset, range(4096))
 
-    if args.compute_basal_loss:
-        loss = ApproximatorDataset.compute_basal_loss(ApproximatorDataset(ipd_groups))
-        print(f"Dataset Basal Loss: {loss}")
+    # loss = ApproximatorDataset.compute_basal_loss(ApproximatorDataset(ipd_groups))
+    # print(f"Dataset Basal Loss: {loss}")
 
     print(f"Training Dataset: {tr_dataset}")
     print(f"Validation Dataset: {vl_dataset}")
     print("-" * 80)
 
-    print()
+    model = TransformerApproximator(
+        hidden_size=128,
+        num_layers=3,
+        nhead=2,
+        intermediate_size=512,
+    )
 
-    # model = TransformerApproximator(
+    # model = RecurrentApproximator(
     #     hidden_size=256,
     #     num_layers=6,
-    #     nhead=4,
-    #     intermediate_size=1024,
+    #     bidirectional=True,
+    #     cell=nn.GRU,
     # )
-
-    model = RecurrentApproximator(
-        hidden_size=256,
-        num_layers=6,
-        bidirectional=True,
-        cell=nn.GRU,
-    )
 
     print(f"Model:\n{model}")
     print(f"Total Parameters: {round(count_parameters(model) / 1e6, 2)}M")
@@ -434,27 +309,26 @@ def main() -> None:
     print(f"Decoder Parameters: {round(count_parameters(model.decoder) / 1e6, 2)}M")
     print("-" * 80)
 
-    collate_fn = CollateFn(max_length=256)
+    collate_fn = ApproximatorCollateFn(max_length=256)
     loss_fn = ApproximatorLossFn()
-    optimizer = AdamW(model.parameters(), lr=1e-3)
-
-    training_arguments = TrainerArgs(
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    trainer_args = TrainerArgs(
         outdir=args.outdir,
-        num_train_epochs=1000,
-        batch_size=256,
-        logging_steps=-1,
-        disable_tqdm=False,
-        dataloader_num_workers=4,
+        device=args.device,
+        epochs=args.epochs,
+        tr_batch_size=args.tr_batch_size,
+        vl_batch_size=args.vl_batch_size,
+        learning_rate=args.learning_rate,
+        num_workers=args.num_workers,
+        disable_tqdm=args.disable_tqdm,
+        logging_steps=args.logging_steps,
     )
-    trainer = Trainer(
-        training_arguments,
+    trainer = ApproximatorTrainer(
+        trainer_args,
         model,
         tr_dataset,
         vl_dataset,
         collate_fn,
         loss_fn,
-        optimizer,
     )
 
     trainer()

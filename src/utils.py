@@ -3,8 +3,11 @@ Utilities.
 """
 
 import math
+import random
 from pprint import pformat
+from typing import Optional
 
+import numpy as np
 import torch
 from torch import tensor, Tensor, nn
 
@@ -42,6 +45,21 @@ def count_parameters(model: nn.Module, requires_grad: bool = False) -> int:
 
 def tensor_memory_size(x: Tensor) -> int:
     return x.element_size() * x.nelement()
+
+
+class ShapeError(ValueError):
+
+    def __init__(self, actual_shape: tuple, expected_shape: Optional[tuple] = None):
+        self.expected_shape = tuple(expected_shape)
+        self.actual_shape = tuple(actual_shape) if actual_shape else None
+        super().__init__(f"Recieved: {self.actual_shape}. Expected: {self.expected_shape}")
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def test():
