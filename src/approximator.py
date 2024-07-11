@@ -75,7 +75,7 @@ def compute_basal_loss(
     batch_size: int = 4096,
 ) -> float:
     """
-    ~13.5M for max_length==256.
+    This gives misleading values.
     """
     dataset = ApproximatorDataset(ipd_groups)
     collate_fn = ApproximatorCollateFn(max_length)
@@ -86,7 +86,7 @@ def compute_basal_loss(
     for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
         x = batch[0].to(device)
         y = batch[1].to(device)
-        loss = loss_fn.forward(x[:, 1:], y[:, 1:]).item()
+        loss = loss_fn.forward(x, y).item()
         losses.append(loss)
     return mean(losses)
 
@@ -112,12 +112,26 @@ class ApproximatorCollateFn:
 
 
 class ApproximatorLossFn(nn.Module):
+    """
+    TODO:
+     - Figure out a better way to handle mismatching special tokens. The problem
+     is that the loss between the real value and a special token is going to be
+     disproportionately high. At the moment, we simply ignore the loss between
+     values that correspond to the positions of special tokens in the target,
+     but this is not ideal, because it does not consider special tokens that may
+     appear in the input. We can't simply ignore positions where special tokens
+     appear in the input AND the target because then the model could learn to
+     predict excess special tokens since their loss is completely ignored.
+     - Figure out a better way to handle mismatching sequence lengths.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
+        # y_pred_specials = (y_true == PAD) | (y_true == BOS) | (y_true == EOS)
+        # y_true_specials = (y_true == PAD) | (y_true == BOS) | (y_true == EOS)
         mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
         return self.loss_fn.forward(y_pred[mask], y_true[mask])
 
