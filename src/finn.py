@@ -76,6 +76,7 @@ class FINNDataset(Dataset, ABC):
         as_tensors: bool = False,
         flow_length: Optional[int] = None,
         pad_value: int = 0,
+        use_different_noises: bool = False,
     ) -> None:
         if as_tensors and not isinstance(flow_length, int):
             raise ValueError("If `as_tensors` is True, a `flow_length` must be provided.")
@@ -90,6 +91,7 @@ class FINNDataset(Dataset, ABC):
         self.pad_value = pad_value
         self.delay_sampler = Laplace(0, amplitude)
         self.noise_sampler_sampler = Uniform(noise_deviation_low, noise_deviation_high)
+        self.use_different_noises = use_different_noises
 
         if self.as_tensors:
             self.ipds = [ipd[0: self.flow_length] for ipd in self.ipds]
@@ -97,12 +99,13 @@ class FINNDataset(Dataset, ABC):
 
         self.__post_init__()
 
-    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
         ipd = self.get_ipd(idx)
         fingerprint = self.get_fingerprint(idx)
         delay = self.get_delay(idx)
-        noise = self.get_noise(idx)
-        return fingerprint, ipd, delay, noise
+        noise_1 = self.get_noise_1(idx)
+        noise_2 = self.get_noise_2(idx)
+        return fingerprint, ipd, delay, noise_1, noise_2
 
     def __len__(self) -> int:
         return len(self.ipds)
@@ -163,7 +166,11 @@ class FINNDataset(Dataset, ABC):
         ...
 
     @abstractmethod
-    def get_noise(self, idx: int) -> Tensor:
+    def get_noise_1(self, idx: int) -> Tensor:
+        ...
+
+    @abstractmethod
+    def get_noise_2(self, idx: int) -> Optional[Tensor]:
         ...
 
 
@@ -183,7 +190,13 @@ class DynamicFINNDataset(FINNDataset):
         ipd = self.get_ipd(idx)
         return self._get_delay(len(ipd))
 
-    def get_noise(self, idx: int) -> Tensor:
+    def get_noise_1(self, idx: int) -> Tensor:
+        ipd = self.get_ipd(idx)
+        return self._get_noise(len(ipd))
+
+    def get_noise_2(self, idx: int) -> Optional[Tensor]:
+        if not self.use_different_noises:
+            return None
         ipd = self.get_ipd(idx)
         return self._get_noise(len(ipd))
 
@@ -196,21 +209,28 @@ class StaticFINNDataset(FINNDataset):
         iterable = tqdm(self.ipds, total=len(self), desc="Generating Delays...")
         self.delays = [self._get_delay(len(ipd)) for ipd in iterable]
         iterable = tqdm(self.ipds, total=len(self), desc="Generating Noises...")
-        self.noises = [self._get_noise(len(ipd)) for ipd in iterable]
+        self.noises_1 = [self._get_noise(len(ipd)) for ipd in iterable]
+        if self.use_different_noises:
+            iterable = tqdm(self.ipds, total=len(self), desc="Generating Noises...")
+            self.noises_2 = [self._get_noise(len(ipd)) for ipd in iterable]
 
         if self.as_tensors:
             # If True, the ipds should have already been padded to the same length, so we can stack
             # without concern that the tensors may have different lengths.
             self.fingerprints = torch.stack(self.fingerprints, dim=0)
             self.delays = torch.stack(self.delays, dim=0)
-            self.noises = torch.stack(self.noises, dim=0)
+            self.noises_1 = torch.stack(self.noises_1, dim=0)
+            if self.use_different_noises:
+                self.noises_2 = torch.stack(self.noises_2, dim=0)
 
     @property
     def memory_size(self) -> int:
         m_ipds = sum(tensor_memory_size(x) for x in self.ipds)
         m_fingerprints = sum(tensor_memory_size(x) for x in self.fingerprints)
         m_delays = sum(tensor_memory_size(x) for x in self.delays)
-        m_noises = sum(tensor_memory_size(x) for x in self.noises)
+        m_noises = sum(tensor_memory_size(x) for x in self.noises_1)
+        if self.use_different_noises:
+            m_noises += sum(tensor_memory_size(x) for x in self.noises_2)
         return m_ipds + m_fingerprints + m_delays + m_noises
 
     def get_ipd(self, idx: int) -> Tensor:
@@ -222,8 +242,13 @@ class StaticFINNDataset(FINNDataset):
     def get_delay(self, idx: int) -> Tensor:
         return self.delays[idx]
 
-    def get_noise(self, idx: int) -> Tensor:
-        return self.noises[idx]
+    def get_noise_1(self, idx: int) -> Tensor:
+        return self.noises_1[idx]
+
+    def get_noise_2(self, idx: int) -> Optional[Tensor]:
+        if not self.use_different_noises:
+            return None
+        return self.noises_2[idx]
 
 
 class FINNCollateFn:
@@ -242,20 +267,22 @@ class FINNCollateFn:
         self.truncate = truncate
         self.pad_value = pad_value
 
-    def __call__(self, batch: list[tuple[Tensor, Tensor, Tensor, Tensor]]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        fingerprints, ipds, delays, noises = [], [], [], []
-        for fingerprint, ipd, delay, noise in batch:
+    def __call__(self, batch: list[tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]]) -> tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+        fingerprints, ipds, delays, noises_1, noises_2 = [], [], [], [], []
+        for fingerprint, ipd, delay, noise_1, noise_2 in batch:
             fingerprints.append(fingerprint)
             ipds.append(ipd)
             delays.append(delay)
-            noises.append(noise)
+            noises_1.append(noise_1)
+            noises_2.append(noise_2)
 
         fingerprints = self.prepare_sequence(fingerprints, self.fingerprint_length)
         ipds = self.prepare_sequence(ipds, self.flow_length)
         delays = self.prepare_sequence(delays, self.flow_length)
-        noises = self.prepare_sequence(noises, self.flow_length)
+        noises_1 = self.prepare_sequence(noises_1, self.flow_length)
+        noises_2 = self.prepare_sequence(noises_2, self.flow_length) if noises_2[0] is not None else None
 
-        return fingerprints, ipds, delays, noises
+        return fingerprints, ipds, delays, noises_1, noises_2
 
     def prepare_sequence(self, sequence: list[Tensor], maximum: Optional[int] = None) -> Tensor:
         if self.truncate:
@@ -423,26 +450,31 @@ class FINNModel(nn.Module):
         self.encoder = FINNEncoder(fingerprint_length + flow_length, flow_length)
         self.decoder = FINNDecoder(flow_length, fingerprint_length)
 
-    def forward(self, fingerprint: Tensor, ipd: Tensor, noise: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, fingerprint: Tensor, ipd: Tensor, noise_1: Tensor, noise_2: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
         """
         Args:
           fingerprint: Tensor - The fingerprint tensor.
           ipd: Tensor - The inter-packet delays tensor.
-          noise: Tensor - The noise tensor.
+          noise_1: Tensor - The noise tensor to feed to the encoder.
+          noise_2: Tensor - The noise tensor to add to the IPDs. If None, noise_1 is used.
         Returns:
           Tensor - The predicted fingerprint delay.
           Tensor - The predicted fingerprint.
         """
+        noise_2 = noise_1.clone() if noise_2 is None else noise_2
+
         if fingerprint.dim() != 2 or fingerprint.shape[1] != self.fingerprint_length:
             raise ShapeError(fingerprint.shape, ("*", self.fingerprint_length))
         if ipd.dim() != 2 or ipd.shape[1] != self.flow_length:
             raise ShapeError(ipd.shape, ("*", self.flow_length))
-        if noise.dim() != 2 or noise.shape[1] != self.flow_length:
-            raise ShapeError(noise.shape, ("*", self.flow_length))
+        if noise_1.dim() != 2 or noise_1.shape[1] != self.flow_length:
+            raise ShapeError(noise_1.shape, ("*", self.flow_length))
+        if noise_2.dim() != 2 or noise_2.shape[1] != self.flow_length:
+            raise ShapeError(noise_2.shape, ("*", self.flow_length))
 
-        fingerprint_and_noise = torch.cat((fingerprint, noise), dim=1)
+        fingerprint_and_noise = torch.cat((fingerprint, noise_1), dim=1)
         delay_pred = self.encoder.forward(fingerprint_and_noise)
-        noisy_marked_ipd = self.combine_3(ipd, delay_pred, noise)
+        noisy_marked_ipd = self.combine_3(ipd, delay_pred, noise_2)
         fingerprint_pred = self.decoder(noisy_marked_ipd)
 
         return delay_pred, fingerprint_pred
@@ -472,10 +504,11 @@ class FINNTrainer(Trainer):
         fingerprint: Tensor = batch[0].to(self.args.device)
         ipd: Tensor = batch[1].to(self.args.device)
         delay: Tensor = batch[2].to(self.args.device)
-        noise: Tensor = batch[3].to(self.args.device)
+        noise_1: Tensor = batch[3].to(self.args.device)
+        noise_2: Optional[Tensor] = batch[4].to(self.args.device) if batch[4] is not None else None
 
         self.model.zero_grad()
-        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
+        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise_1, noise_2)
         weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
         weighted_loss.backward()
         self.optimizer.step()
@@ -491,9 +524,10 @@ class FINNTrainer(Trainer):
         fingerprint: Tensor = batch[0].to(self.args.device)
         ipd: Tensor = batch[1].to(self.args.device)
         delay: Tensor = batch[2].to(self.args.device)
-        noise: Tensor = batch[3].to(self.args.device)
+        noise_1: Tensor = batch[3].to(self.args.device)
+        noise_2: Optional[Tensor] = batch[4].to(self.args.device) if batch[4] is not None else None
 
-        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise)
+        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise_1, noise_2)
         weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
         predictions = F.softmax(fingerprint_pred, dim=-1)
 
@@ -540,6 +574,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help=".")
     parser.add_argument("--dynamic", action="store_true", help=".")
     parser.add_argument("--use_same_dataset", action="store_true", help=".")
+    parser.add_argument("--use_different_noises", action="store_true", help=".")
     parser.add_argument("--demo", action="store_true", help=".")
     args = parser.parse_args()
 
@@ -576,6 +611,7 @@ def main():
         noise_deviation_high=args.noise_deviation_high,
         as_tensors=True,
         flow_length=args.flow_length,
+        use_different_noises=args.use_different_noises,
     )
     tr_dataset = DatasetConstructor(tr_ipds)
     vl_dataset = DatasetConstructor(vl_ipds)
