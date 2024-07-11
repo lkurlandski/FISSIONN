@@ -118,7 +118,8 @@ class ApproximatorLossFn(nn.Module):
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
-        return self.loss_fn.forward(y_pred, y_true)
+        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
+        return self.loss_fn.forward(y_pred[mask], y_true[mask])
 
 
 class ApproximatorDecoder:
@@ -390,8 +391,8 @@ def main() -> None:
     vl_dataset = ApproximatorDataset(vl_ipd_groups)
     vl_dataset = Subset(vl_dataset, range(min(args.vl_num_samples, len(vl_dataset))))
 
-    # print(f"tr_basal_loss={compute_basal_loss(tr_ipd_groups, MAX_LENGTH, args.device, 4096)}")
-    # print(f"vl_basal_loss={compute_basal_loss(vl_ipd_groups, MAX_LENGTH, args.device, 4096)}")
+    print(f"tr_basal_loss={compute_basal_loss(tr_ipd_groups, MAX_LENGTH, args.device, 4096)}")
+    print(f"vl_basal_loss={compute_basal_loss(vl_ipd_groups, MAX_LENGTH, args.device, 4096)}")
 
     print(f"Training Dataset: {tr_dataset}")
     print(f"Validation Dataset: {vl_dataset}")
