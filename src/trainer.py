@@ -96,7 +96,7 @@ class Trainer(ABC):
         return AdamW(self.model.parameters(), lr=self.args.learning_rate)
 
     def create_scheduler(self) -> Optional[LRScheduler]:
-        return ReduceLROnPlateau(self.optimizer, min_lr=1e-6)
+        return ReduceLROnPlateau(self.optimizer, min_lr=1e-6, patience=0)
 
     def __call__(self) -> Self:
         if self.args.outdir.exists():
