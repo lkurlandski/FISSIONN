@@ -253,14 +253,14 @@ class TransformerApproximator(nn.Module):
         return t
 
     @classmethod
-    def from_pretrained(cls, file: os.PathLike) -> TransformerApproximator:
-        return torch.load(file)
+    def from_pretrained(cls, file: os.PathLike, **kwds) -> TransformerApproximator:
+        return torch.load(file, **kwds)
 
     @staticmethod
     def create_mask(
         x: Tensor, y: Tensor, device: Optional[torch.cuda.device] = None,
     ) -> tuple[BoolTensor, BoolTensor, BoolTensor, BoolTensor]:
-        # NOTE: positions with a True value are not allowed to participate in the attention
+        # Positions with a True value are not allowed to participate in the attention
         l_x = x.size(1)
         l_y = y.size(1)
 
@@ -275,7 +275,7 @@ class TransformerApproximator(nn.Module):
     def beam_search(self, x: Tensor, max_len: int, beam_size: int) -> Tensor:
         raise NotImplementedError("Beam Search Not Yet Implemented.")
 
-    def greedy_decode(self, x: Tensor, max_len: int) -> Tensor:
+    def greedy_decode(self, x: Tensor, max_length: int) -> Tensor:
         if self.training:
             raise RuntimeError("Call `eval()` before using model for inference.")
         if torch.is_grad_enabled():
@@ -287,26 +287,42 @@ class TransformerApproximator(nn.Module):
         L = x.size(1)
         D = x.device
 
-        x = x.unsqueeze(2)
-        src = self.projection_in(x)
-        mask = (torch.zeros(B, L, L)).type(torch.bool)
-        mem = self.encoder.forward(src, mask)
-        ys = bos((B, 1, 1)).to(D)
+        src = self.embed(x)
+        src_mask = torch.zeros((L, L), dtype=torch.bool, device=D)
+        src_padding_mask = (x == PAD).to(D)
+        mem = self.encoder.forward(src, src_mask, src_padding_mask)
+        y = bos((B, 1)).to(D)
 
-        for l in range(1, max_len):
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(l, torch.bool, D)
-            out = self.decoder.forward(ys, mem, tgt_mask)
-            y_pred = self.projection_out(out)
-            # TODO:
-        return ys
+        # Tracks which sequences have generated EOS.
+        generated_eos = torch.zeros((B,), dtype=torch.bool, device=D)
 
-    def translate(self, x: Tensor, max_len: int, alg: Literal["greedy", "beam"], **kwds) -> Tensor:
+        for l in range(1, max_length - 1):
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(l, D, torch.bool)
+            tgt = self.embed(y)
+            out = self.decoder.forward(tgt, mem, tgt_mask)
+
+            y_pred = self.projection_out(out).squeeze(2)
+            y_next = y_pred[:, -1]
+            y = torch.cat([y, y_next.unsqueeze(1)], dim=1)
+
+            generated_eos = generated_eos | (y_next == EOS)
+            if generated_eos.all():
+                break
+
+        # Add EOS to the sequences which have not generated EOS yet. Else add PAD.
+        final = eos((B,)).to(D)
+        final[~generated_eos] = PAD
+        y = torch.cat([y, final.unsqueeze(1)], dim=1)
+
+        return y
+
+    def translate(self, x: Tensor, max_length: int, alg: Literal["greedy", "beam"]) -> Tensor:
         self.eval()
         with torch.no_grad():
             if alg == "greedy":
-                y = self.greedy_decode(x, max_len)
+                y = self.greedy_decode(x, max_length)
             elif alg == "beam":
-                y = self.beam_search(x, max_len)
+                y = self.beam_search(x, max_length)
             else:
                 raise ValueError(f"Invalid Algorithm: {alg}")
         return y
