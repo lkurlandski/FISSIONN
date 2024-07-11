@@ -4,14 +4,16 @@ A network to approximate the noising process of IPDs through SSI chains.
 
 from __future__ import annotations
 from itertools import chain, combinations
+import math
 import os
 from pprint import pformat
+from statistics import mean
 import sys
-from typing import Optional
+from typing import Literal, Optional
 
 from sklearn.model_selection import train_test_split
 import torch
-from torch import nn, Tensor
+from torch import nn, Tensor, BoolTensor
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
@@ -30,8 +32,17 @@ from src.utils import (
 # pylint: enable=wrong-import-position
 
 
+PAD = -10000.0
+BOS = -10001.0
+EOS = -10002.0
+
+
 def bos(shape: tuple[int]) -> Tensor:
-    return torch.zeros(shape, dtype=torch.float32)
+    return torch.full(shape, BOS)
+
+
+def eos(shape: tuple[int]) -> Tensor:
+    return torch.full(shape, EOS)
 
 
 class ApproximatorDataset(Dataset):
@@ -39,7 +50,6 @@ class ApproximatorDataset(Dataset):
     def __init__(self, ipd_groups: list[list[list[int]]]) -> None:
         self.ipd_pairs = chain.from_iterable(combinations(ipd_group, 2) for ipd_group in ipd_groups)
         self.ipd_pairs: list[tuple[list[int], list[int]]] = list(self.ipd_pairs)
-        self._basal_loss = None
 
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
         x, y = self.ipd_pairs[idx]
@@ -57,56 +67,64 @@ class ApproximatorDataset(Dataset):
     def __str__(self) -> str:
         return repr(self)
 
-    @staticmethod
-    def compute_basal_loss(dataset: ApproximatorDataset) -> float:
-        collate_fn = ApproximatorCollateFn(max_length=256)
-        loss_fn = ApproximatorLossFn(pad_to_same_length=True)
-        dataloader = DataLoader(dataset, batch_size=1024, collate_fn=collate_fn)
-        pbar = tqdm(dataloader, desc="Computing Basal Loss...")
-        loss = sum(loss_fn.forward(y, x).item() for x, y in pbar)
-        return loss / len(dataset)
+
+def compute_basal_loss(
+    ipd_groups: list[list[list[int]]],
+    max_length: int,
+    device: Optional[torch.cuda.device] = None,
+    batch_size: int = 4096,
+) -> float:
+    """
+    ~13.5M for max_length==256.
+    """
+    dataset = ApproximatorDataset(ipd_groups)
+    collate_fn = ApproximatorCollateFn(max_length)
+    loss_fn = ApproximatorLossFn()
+    dataloader = DataLoader(dataset, batch_size, False, collate_fn=collate_fn, drop_last=True)
+    pbar = tqdm(dataloader, desc="Computing Basal Loss...")
+    losses = []
+    for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
+        x = batch[0].to(device)
+        y = batch[1].to(device)
+        loss = loss_fn.forward(x[:, 1:], y[:, 1:]).item()
+        losses.append(loss)
+    return mean(losses)
 
 
 class ApproximatorCollateFn:
 
-    def __init__(
-        self,
-        max_length: int = sys.maxsize,
-        pad_value: int = 0,
-    ) -> None:
+    def __init__(self, max_length: int = sys.maxsize) -> None:
         self.max_length = max_length
-        self.pad_value = pad_value
 
     def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
-        x, y = [], []
+        b = bos((1,))
+        e = eos((1,))
+        x = []
+        y = []
         for x_, y_ in batch:
-            x.append(torch.cat([bos((1,)), x_])[0:self.max_length])
-            y.append(torch.cat([bos((1,)), y_])[0:self.max_length])
-        x = pad_sequence(x, batch_first=True, padding_value=self.pad_value)
-        y = pad_sequence(y, batch_first=True, padding_value=self.pad_value)
+            x_ = x_[0 : self.max_length - 2]
+            y_ = y_[0 : self.max_length - 2]
+            x.append(torch.cat([b, x_, e]))
+            y.append(torch.cat([b, y_, e]))
+        x = pad_sequence(x, batch_first=True, padding_value=PAD)
+        y = pad_sequence(y, batch_first=True, padding_value=PAD)
         return x, y
 
 
 class ApproximatorLossFn(nn.Module):
 
-    def __init__(self, pad_to_same_length: bool = False, trim_to_same_length: bool = False) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.pad_to_same_length = pad_to_same_length
-        self.trim_to_same_length = trim_to_same_length
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
-        if y_pred.size(1) != y_true.size(1):
-            if self.pad_to_same_length:
-                length = max(y_pred.size(1), y_true.size(1))
-                y_pred = nn.functional.pad(y_pred, (0, length - y_pred.size(1)), value=0)
-                y_true = nn.functional.pad(y_true, (0, length - y_true.size(1)), value=0)
-            if self.trim_to_same_length:
-                length = min(y_pred.size(1), y_true.size(1))
-                y_pred = y_pred[:, :length]
-                y_true = y_true[:, :length]
-
         return self.loss_fn.forward(y_pred, y_true)
+
+
+class ApproximatorDecoder:
+
+    def __init__(self) -> None:
+        ...
 
 
 class RecurrentApproximator(nn.Module):
@@ -134,15 +152,6 @@ class RecurrentApproximator(nn.Module):
         self.projection_out = nn.Linear(2 * hidden_size if bidirectional else hidden_size, 1)
 
     def forward(self, x: Tensor, _: Tensor) -> Tensor:
-        """
-        Args:
-            x (Tensor): Batch of IPDs before entering a stepping stone sequence. 
-                Shape: (B, L). The IPDs should start with a BOS `token`, i.e., 0.0.
-
-        Returns:
-            Tensor: Batch of IPDs after entering a stepping stone sequence (simulated).
-                Shape: (B, L).
-        """
         if x.dim() != 2:
             raise ShapeError((x.shape), ("B", "L"))
 
@@ -155,10 +164,35 @@ class RecurrentApproximator(nn.Module):
         return y_pred
 
 
+class PositionalEncoding(nn.Module):
+
+    embedding: Tensor
+
+    def __init__(self, emb_size: int, max_length: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
+        pos = torch.arange(0, max_length).reshape(max_length, 1)
+        embedding = torch.zeros((max_length, emb_size))
+        embedding[:, 0::2] = torch.sin(pos * den)
+        embedding[:, 1::2] = torch.cos(pos * den)
+        embedding = embedding.unsqueeze(0)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("embedding", embedding)
+
+    def forward(self, t: Tensor):
+        if t.dim() != 3:
+            raise ShapeError((t.shape), ("B", "L", "H"))
+        p = self.embedding[:, :t.size(1), :]
+        t = t + p
+        t = self.dropout(t)
+        return t
+
+
 class TransformerApproximator(nn.Module):
 
     def __init__(
         self,
+        max_length: int,
         hidden_size: int,
         num_layers: int,
         nhead: int,
@@ -167,6 +201,7 @@ class TransformerApproximator(nn.Module):
         super().__init__()
         intermediate_size = intermediate_size if intermediate_size is not None else 4 * hidden_size
         self.projection_in = nn.Linear(1, hidden_size)
+        self.positional_embedding = PositionalEncoding(hidden_size, max_length)
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 hidden_size, nhead, intermediate_size, batch_first=True,
@@ -187,41 +222,94 @@ class TransformerApproximator(nn.Module):
         y: Optional[Tensor] = None,
         mem: Optional[Tensor] = None,
     ) -> Tensor:
-        """
-        Args:
-            x (Tensor): Batch of IPDs before entering a stepping stone sequence. 
-                Shape: (B, L). The IPDs should start with a BOS `token`, i.e., 0.0.
-            y (Tensor): Batch of IPDs after entering a stepping stone sequence.
-                Shape: (B, L). These IPDs should start with a BOS `token`, i.e., 0.0.
-            mem (Tensor): Memory from the encoder. If not provided, the encoder will be called.
-                Shape: (B, L, H).
-
-        Returns:
-            Tensor: Batch of IPDs after entering a stepping stone sequence (simulated).
-                Shape: (B, L - 1). These IPDs do not start with the BOS `token`.
-        """
         if x is not None:
             if x.dim() != 2:
                 raise ShapeError((x.shape), ("B", "L"))
-            x = x.unsqueeze(2)
         if y is not None:
             if y.dim() != 2:
                 raise ShapeError((y.shape), ("B", "L"))
-            y = y.unsqueeze(2)
         if mem is not None:
             if mem.dim() != 3:
                 raise ShapeError((mem.shape), ("B", "L", "H"))
 
+        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = self.create_mask(x, y, x.device)
+
         if mem is None:
-            src = self.projection_in.forward(x)
-            mem = self.encoder.forward(src)
+            src = self.embed(x)
+            mem = self.encoder.forward(src, src_mask, src_padding_mask)
 
-        tgt = self.projection_in.forward(y)
-        out = self.decoder.forward(tgt[:, :-1, :], mem)
-        out = torch.cat([bos((out.size(0), 1, out.size(2))).to(out.device), out], dim=1)
-
+        tgt = self.embed(y)
+        out = self.decoder.forward(tgt, mem, tgt_mask, None, tgt_padding_mask)
         y_pred = self.projection_out.forward(out).squeeze(2)
+
         return y_pred
+
+    def embed(self, t: Tensor) -> Tensor:
+        if t.dim() != 2:
+            raise ShapeError((t.shape), ("B", "L"))
+        t = t.unsqueeze(2)
+        t = self.projection_in.forward(t)
+        t = self.positional_embedding.forward(t)
+        return t
+
+    @classmethod
+    def from_pretrained(cls, file: os.PathLike) -> TransformerApproximator:
+        return torch.load(file)
+
+    @staticmethod
+    def create_mask(
+        x: Tensor, y: Tensor, device: Optional[torch.cuda.device] = None,
+    ) -> tuple[BoolTensor, BoolTensor, BoolTensor, BoolTensor]:
+        # NOTE: positions with a True value are not allowed to participate in the attention
+        l_x = x.size(1)
+        l_y = y.size(1)
+
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(l_y, device=device, dtype=torch.bool)
+        src_mask = torch.zeros((l_x, l_x), dtype=torch.bool, device=device)
+
+        src_padding_mask = (x == PAD).to(device)
+        tgt_padding_mask = (y == PAD).to(device)
+
+        return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
+
+    def beam_search(self, x: Tensor, max_len: int, beam_size: int) -> Tensor:
+        raise NotImplementedError("Beam Search Not Yet Implemented.")
+
+    def greedy_decode(self, x: Tensor, max_len: int) -> Tensor:
+        if self.training:
+            raise RuntimeError("Call `eval()` before using model for inference.")
+        if torch.is_grad_enabled():
+            raise RuntimeError("Disable gradient computation before using model for inference.")
+        if x.dim() != 2:
+            raise ShapeError((x.shape), ("B", "L"))
+
+        B = x.size(0)
+        L = x.size(1)
+        D = x.device
+
+        x = x.unsqueeze(2)
+        src = self.projection_in(x)
+        mask = (torch.zeros(B, L, L)).type(torch.bool)
+        mem = self.encoder.forward(src, mask)
+        ys = bos((B, 1, 1)).to(D)
+
+        for l in range(1, max_len):
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(l, torch.bool, D)
+            out = self.decoder.forward(ys, mem, tgt_mask)
+            y_pred = self.projection_out(out)
+            # TODO:
+        return ys
+
+    def translate(self, x: Tensor, max_len: int, alg: Literal["greedy", "beam"], **kwds) -> Tensor:
+        self.eval()
+        with torch.no_grad():
+            if alg == "greedy":
+                y = self.greedy_decode(x, max_len)
+            elif alg == "beam":
+                y = self.beam_search(x, max_len)
+            else:
+                raise ValueError(f"Invalid Algorithm: {alg}")
+        return y
 
 
 class ApproximatorTrainer(Trainer):
@@ -233,13 +321,13 @@ class ApproximatorTrainer(Trainer):
     loss_fn: ApproximatorLossFn
 
     def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> dict[str, float]:
-
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
 
         self.model.zero_grad()
-        y_pred = self.model.forward(x, y)
-        loss: Tensor = self.loss_fn.forward(y_pred, y)
+        y_pred = self.model.forward(x, y[:, :-1])
+        y_pred = y_pred[:, 1:] if y_pred.size(1) == y.size(1) else y_pred  # trim for recurrent models
+        loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
         loss.backward()
         self.optimizer.step()
 
@@ -249,16 +337,21 @@ class ApproximatorTrainer(Trainer):
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
 
-        y_pred = self.model.forward(x, y)
-        loss = self.loss_fn.forward(y_pred, y)
+        y_pred = self.model.forward(x, y[:, :-1])
+        y_pred = y_pred[:, 1:] if y_pred.size(1) == y.size(1) else y_pred  # trim for recurrent models
+        loss = self.loss_fn.forward(y_pred, y[:, 1:])
 
         return {"vl_loss": loss.item()}
 
 
 def main() -> None:
 
+    MAX_LENGTH = 256
+
     parser = TrainerArgumentParser()
     parser.add_argument("--seed", type=int, default=0, help=".")
+    parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
+    parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
     args = parser.parse_args()
 
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
@@ -277,28 +370,28 @@ def main() -> None:
 
     tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
     tr_dataset = ApproximatorDataset(tr_ipd_groups)
+    tr_dataset = Subset(tr_dataset, range(min(args.tr_num_samples, len(tr_dataset))))
     vl_dataset = ApproximatorDataset(vl_ipd_groups)
+    vl_dataset = Subset(vl_dataset, range(min(args.vl_num_samples, len(vl_dataset))))
 
-    # tr_dataset = Subset(tr_dataset, range(4096))
-    # vl_dataset = Subset(vl_dataset, range(4096))
-
-    # loss = ApproximatorDataset.compute_basal_loss(ApproximatorDataset(ipd_groups))
-    # print(f"Dataset Basal Loss: {loss}")
+    # print(f"tr_basal_loss={compute_basal_loss(tr_ipd_groups, MAX_LENGTH, args.device, 4096)}")
+    # print(f"vl_basal_loss={compute_basal_loss(vl_ipd_groups, MAX_LENGTH, args.device, 4096)}")
 
     print(f"Training Dataset: {tr_dataset}")
     print(f"Validation Dataset: {vl_dataset}")
     print("-" * 80)
 
     model = TransformerApproximator(
-        hidden_size=128,
-        num_layers=3,
-        nhead=2,
-        intermediate_size=512,
+        max_length=MAX_LENGTH,
+        hidden_size=256,
+        num_layers=4,
+        nhead=4,
+        intermediate_size=1024,
     )
 
     # model = RecurrentApproximator(
-    #     hidden_size=256,
-    #     num_layers=6,
+    #     hidden_size=64,
+    #     num_layers=2,
     #     bidirectional=True,
     #     cell=nn.GRU,
     # )
@@ -309,7 +402,7 @@ def main() -> None:
     print(f"Decoder Parameters: {round(count_parameters(model.decoder) / 1e6, 2)}M")
     print("-" * 80)
 
-    collate_fn = ApproximatorCollateFn(max_length=256)
+    collate_fn = ApproximatorCollateFn(max_length=MAX_LENGTH)
     loss_fn = ApproximatorLossFn()
     trainer_args = TrainerArgs(
         outdir=args.outdir,
