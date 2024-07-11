@@ -1,5 +1,8 @@
 """
 Basic training utilities.
+
+TODO:
+ - Add support for better saving/loading of models.
 """
 
 from abc import ABC, abstractmethod
@@ -19,6 +22,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer, AdamW
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from tqdm import tqdm
 
@@ -65,7 +69,7 @@ class Trainer(ABC):
     OVERWRITE_OUTDIRS = ("tmp", "test")
     tr_metric_keys = ("tr_loss", "tr_time")
     vl_metric_keys = ("vl_loss", "vl_time")
-    other_keys = ("epoch",)
+    other_keys = ("epoch", "learning_rate")
 
     def __init__(
         self,
@@ -75,20 +79,24 @@ class Trainer(ABC):
         vl_dataset: Dataset | IterableDataset,
         collate_fn: Callable,
         loss_fn: Module,
-        optimizer_fn: Optional[Callable[[Iterable[Tensor]], Optimizer]] = None,
     ) -> None:
         self.args = args
-        self.model = model
+        self.model = model.to(args.device)
         self.tr_dataset = tr_dataset
         self.vl_dataset = vl_dataset
         self.collate_fn = collate_fn
         self.loss_fn = loss_fn
-        if optimizer_fn:
-            self.optimizer = optimizer_fn(self.model.parameters())
-        else:
-            self.optimizer = AdamW(self.model.parameters(), lr=args.learning_rate)
+        self.optimizer = self.create_optimizer()
+        self.scheduler = self.create_scheduler()
         self.log = []
-        self.best = (-1, sys.maxsize)
+        self.best_epoch = -1
+        self.best_metric = -sys.maxsize if args.lower_is_worse else sys.maxsize
+
+    def create_optimizer(self) -> Optimizer:
+        return AdamW(self.model.parameters(), lr=self.args.learning_rate)
+
+    def create_scheduler(self) -> Optional[LRScheduler]:
+        return ReduceLROnPlateau(self.optimizer, verbose=True, min_lr=1e-6)
 
     def __call__(self) -> Self:
         if self.args.outdir.exists():
@@ -97,8 +105,6 @@ class Trainer(ABC):
             else:
                 raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
         self.args.outdir.mkdir(parents=True, exist_ok=True)
-
-        self.model.to(self.args.device)
 
         tr_metrics = {k: float("nan") for k in self.tr_metric_keys}
         vl_metrics = self.evaluate()
@@ -109,8 +115,11 @@ class Trainer(ABC):
         for epoch in pbar:
             tr_metrics = self.train()
             vl_metrics = self.evaluate()
-            d = {"epoch": epoch} | tr_metrics | vl_metrics
-            self.on_epoch_end(d, 0)
+            learning_rate = self.scheduler.get_last_lr()[0] if self.scheduler is not None else self.args.learning_rate
+            d = {"epoch": epoch, "learning_rate": learning_rate} | tr_metrics | vl_metrics
+            self.on_epoch_end(d, epoch)
+            if self.scheduler is not None:
+                self.scheduler.step(vl_metrics["vl_loss"])
 
     def on_epoch_end(self, results: dict[str, float], epoch: int):
         self.log.append(results)
@@ -119,15 +128,17 @@ class Trainer(ABC):
             fp.write(json.dumps(results) + "\n")
         torch.save(self.model, self.args.outdir / f"model_{epoch}.pth")
 
-        if self.args.lower_is_worse and results[self.args.metric] > self.best[1]:
-            self.best = (epoch, results[self.args.metric])
-        elif not self.args.lower_is_worse and results[self.args.metric] < self.best[1]:
-            self.best = (epoch, results[self.args.metric])
+        if self.args.lower_is_worse and results[self.args.metric] > self.best_metric:
+            self.best_epoch = epoch
+            self.best_metric = results[self.args.metric]
+        elif not self.args.lower_is_worse and results[self.args.metric] < self.best_metric:
+            self.best_epoch = epoch
+            self.best_metric = results[self.args.metric]
 
         checkpoints = sorted(self.args.outdir.glob("model_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
         for checkpoint in checkpoints:
             e = int(checkpoint.stem.split("_")[1])
-            if e not in (self.best[0], epoch):
+            if e not in (self.best_epoch, epoch):
                 checkpoint.unlink()
 
     def train(self) -> dict[str, float]:
@@ -171,7 +182,8 @@ class Trainer(ABC):
         Returns:
             dict[str, float | list[float]]: dictionary of metrics, which may be a single value,
                 representing an average over the batch, or a list of values, representing the
-                value of the metric for each sample (will be averaged by self.train).
+                value of the metric for each sample (will be averaged by self.train). "tr_loss"
+                must be a key returned by the dictionary.
         """
 
     def evaluate(self) -> dict[str, float]:
@@ -208,7 +220,8 @@ class Trainer(ABC):
         Returns:
             dict[str, float | list[float]]: dictionary of metrics, which may be a single value,
                 representing an average over the batch, or a list of values, representing the
-                value of the metric for each sample (will be averaged by self.train).
+                value of the metric for each sample (will be averaged by self.train). "vl_loss"
+                must be a key returned by the dictionary.
         """
 
     def get_dataloader(self, dataset: Dataset | IterableDataset, batch_size: int, shuffle: bool) -> DataLoader:
