@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import shutil
 from statistics import mean
@@ -40,6 +41,8 @@ class TrainerArgs:
     logging_steps: int = -1
     metric: str = "vl_loss"
     lower_is_worse: bool = False
+    lr_scheduler_patience: Optional[int] = None
+    early_stopping_patience: Optional[int] = None
 
 
 class TrainerArgumentParser(ArgumentParser):
@@ -57,6 +60,36 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--logging_steps", type=int, default=-1)
         self.add_argument("--metric", type=str, default="vl_loss")
         self.add_argument("--lower_is_worse", action="store_true")
+        self.add_argument("--lr_scheduler_patience", type=int, default=None)
+        self.add_argument("--early_stopping_patience", type=int, default=None)
+
+
+class EarlyStopper:
+
+    def __init__(self, patience: int = 0, threshold: float = 0.0001, lower_is_worse: bool = False) -> None:
+        self.patience = patience
+        self.threshold = threshold
+        self.lower_is_worse = lower_is_worse
+        self.best = -sys.maxsize if lower_is_worse else sys.maxsize
+        self.current = None
+        self.count = 0
+
+    def step(self, val: float) -> Self:
+        self.current = val
+        if self.lower_is_worse and (self.current > self.best + self.threshold):
+            self.best = self.current
+            self.count = 0
+        elif not self.lower_is_worse and (self.current < self.best - self.threshold):
+            self.best = self.current
+            self.count = 0
+        return self
+
+    @property
+    def stop(self) -> bool:
+        if self.current == self.best:
+            return False
+        self.count += 1
+        return self.count >= self.patience
 
 
 class Trainer(ABC):
@@ -81,13 +114,14 @@ class Trainer(ABC):
         loss_fn: Module,
     ) -> None:
         self.args = args
-        self.model = model.to(args.device)
+        self.model: Module = model.to(args.device)
         self.tr_dataset = tr_dataset
         self.vl_dataset = vl_dataset
         self.collate_fn = collate_fn
         self.loss_fn = loss_fn
         self.optimizer = self.create_optimizer()
         self.scheduler = self.create_scheduler()
+        self.stopper = self.create_stopper()
         self.log = []
         self.best_epoch = -1
         self.best_metric = -sys.maxsize if args.lower_is_worse else sys.maxsize
@@ -96,7 +130,18 @@ class Trainer(ABC):
         return AdamW(self.model.parameters(), lr=self.args.learning_rate)
 
     def create_scheduler(self) -> Optional[LRScheduler]:
-        return ReduceLROnPlateau(self.optimizer, min_lr=1e-6, patience=0)
+        # Patience varies between [0, 10] and will be one less than the stopper's patience.
+        patience = self.args.lr_scheduler_patience
+        if patience is None:
+            patience = min(100000 // len(self.tr_dataset), 10)
+        return ReduceLROnPlateau(self.optimizer, min_lr=1e-6, patience=patience)
+
+    def create_stopper(self) -> Optional[EarlyStopper]:
+        # Patience varies between [1, 11] and will be one greater than the scheduler's patience.
+        patience = self.args.early_stopping_patience
+        if patience is None:
+            patience = min(100000 // len(self.tr_dataset) + 1, 11)
+        return EarlyStopper(patience, threshold=1e-6, lower_is_worse=self.args.lower_is_worse)
 
     def __call__(self) -> Self:
         if self.args.outdir.exists():
@@ -108,8 +153,10 @@ class Trainer(ABC):
 
         tr_metrics = {k: float("nan") for k in self.tr_metric_keys}
         vl_metrics = self.evaluate()
-        d = {"epoch": 0} | tr_metrics | vl_metrics
-        self.on_epoch_end(d, 0)
+        d = {"epoch": 0, "learning_rate": float("nan")} | tr_metrics | vl_metrics
+        self.update_logs(d)
+        self.update_best(d)
+        self.update_save(d)
 
         pbar = self._get_pbar(range(1, self.args.epochs + 1), desc="Epochs")
         for epoch in pbar:
@@ -117,28 +164,38 @@ class Trainer(ABC):
             vl_metrics = self.evaluate()
             learning_rate = self.scheduler.get_last_lr()[0] if self.scheduler is not None else self.args.learning_rate
             d = {"epoch": epoch, "learning_rate": learning_rate} | tr_metrics | vl_metrics
-            self.on_epoch_end(d, epoch)
+            self.update_logs(d)
+            self.update_best(d)
+            self.update_save(d)
             if self.scheduler is not None:
-                self.scheduler.step(vl_metrics["vl_loss"])
+                self.scheduler.step(vl_metrics[self.args.metric])
+            if self.stopper is not None:
+                self.stopper.step(vl_metrics[self.args.metric])
+                if self.stopper.stop:
+                    break
+            if any(math.isnan(d[m]) or math.isinf(d[m]) for m in ("tr_loss", "vl_loss")):
+                raise ValueError(f"NaN/Inf Loss Detected!")
 
-    def on_epoch_end(self, results: dict[str, float], epoch: int):
+    def update_logs(self, results: dict[str, float]) -> None:
         self.log.append(results)
         print(self._fmt_dict(results))
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
-        torch.save(self.model, self.args.outdir / f"model_{epoch}.pth")
 
+    def update_best(self, results: dict[str, float]) -> None:
         if self.args.lower_is_worse and results[self.args.metric] > self.best_metric:
-            self.best_epoch = epoch
+            self.best_epoch = results["epoch"]
             self.best_metric = results[self.args.metric]
         elif not self.args.lower_is_worse and results[self.args.metric] < self.best_metric:
-            self.best_epoch = epoch
+            self.best_epoch = results["epoch"]
             self.best_metric = results[self.args.metric]
 
+    def update_save(self, results: dict[str, float]) -> None:
+        torch.save(self.model, self.args.outdir / f"model_{results['epoch']}.pth")
         checkpoints = sorted(self.args.outdir.glob("model_*.pth"), key=lambda p: int(p.stem.split("_")[1]))
         for checkpoint in checkpoints:
             e = int(checkpoint.stem.split("_")[1])
-            if e not in (self.best_epoch, epoch):
+            if e not in (self.best_epoch, results["epoch"]):
                 checkpoint.unlink()
 
     def train(self) -> dict[str, float]:
