@@ -144,17 +144,26 @@ class ApproximatorDecoder:
 
 class RecurrentApproximator(nn.Module):
 
+    PUNY = {"hidden_size": 64, "num_layers": 1}
+    TINY = {"hidden_size": 128, "num_layers": 2}
+    SMALL = {"hidden_size": 256, "num_layers": 4}
+    MEDIUM = {"hidden_size": 384, "num_layers": 6}
+    LARGE = {"hidden_size": 512, "num_layers": 8}
+    HUGE = {"hidden_size": 768, "num_layers": 12}
+
     def __init__(
         self,
         hidden_size: int,
         num_layers: int,
         input_size: Optional[int] = None,
         bidirectional: bool = False,
-        cell: nn.RNN | nn.LSTM | nn.GRU = nn.RNN,
+        cell: nn.RNN | nn.LSTM | nn.GRU | Literal["rnn", "lstm", "gru"] = nn.RNN,
     ) -> None:
         super().__init__()
         input_size = input_size if input_size is not None else hidden_size
         self.projection_in = nn.Linear(1, input_size)
+        if isinstance(cell, str):
+            cell = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[cell.lower()]
         self.encoder: nn.RNN | nn.LSTM | nn.GRU = cell(
             input_size, hidden_size, num_layers,
             batch_first=True, bidirectional=bidirectional,
@@ -204,6 +213,13 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerApproximator(nn.Module):
+
+    PUNY = {"hidden_size": 64, "num_layers": 1, "nhead": 1, "intermediate_size": 256}
+    TINY = {"hidden_size": 128, "num_layers": 2, "nhead": 2, "intermediate_size": 512}
+    SMALL = {"hidden_size": 256, "num_layers": 4, "nhead": 4, "intermediate_size": 1024}
+    MEDIUM = {"hidden_size": 384, "num_layers": 6, "nhead": 6, "intermediate_size": 1536}
+    LARGE = {"hidden_size": 512, "num_layers": 8, "nhead": 8, "intermediate_size": 2048}
+    HUGE = {"hidden_size": 768, "num_layers": 12, "nhead": 12, "intermediate_size": 3072}
 
     def __init__(
         self,
@@ -381,6 +397,8 @@ def main() -> None:
 
     parser = TrainerArgumentParser()
     parser.add_argument("--seed", type=int, default=0, help=".")
+    parser.add_argument("--arch", type=str, default="transformer", choice=["transformer", "rnn", "lstm", "gru"], help=".")
+    parser.add_argument("--arch_config", type=str, default="puny", choice=["puny", "tiny", "small", "medium", "large", "huge"], help=".")
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
     args = parser.parse_args()
@@ -405,27 +423,16 @@ def main() -> None:
     vl_dataset = ApproximatorDataset(vl_ipd_groups)
     vl_dataset = Subset(vl_dataset, range(min(args.vl_num_samples, len(vl_dataset))))
 
-    print(f"tr_basal_loss={compute_basal_loss(tr_ipd_groups, MAX_LENGTH, args.device, 4096)}")
-    print(f"vl_basal_loss={compute_basal_loss(vl_ipd_groups, MAX_LENGTH, args.device, 4096)}")
-
     print(f"Training Dataset: {tr_dataset}")
     print(f"Validation Dataset: {vl_dataset}")
     print("-" * 80)
 
-    model = TransformerApproximator(
-        max_length=MAX_LENGTH,
-        hidden_size=256,
-        num_layers=4,
-        nhead=4,
-        intermediate_size=1024,
-    )
-
-    # model = RecurrentApproximator(
-    #     hidden_size=64,
-    #     num_layers=2,
-    #     bidirectional=True,
-    #     cell=nn.GRU,
-    # )
+    if args.arch == "transformer":
+        config = {"max_length": args.max_length} | getattr(TransformerApproximator, args.arch_config.upper())
+        model = TransformerApproximator(**config)
+    else:
+        config = getattr(RecurrentApproximator, args.arch_config.upper())
+        model = RecurrentApproximator(**config)
 
     print(f"Model:\n{model}")
     print(f"Total Parameters: {round(count_parameters(model) / 1e6, 2)}M")
