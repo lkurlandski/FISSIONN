@@ -43,6 +43,7 @@ class TrainerArgs:
     lower_is_worse: bool = False
     lr_scheduler_patience: Optional[int] = None
     early_stopping_patience: Optional[int] = None
+    max_norm: float = 1.0
 
 
 class TrainerArgumentParser(ArgumentParser):
@@ -62,6 +63,7 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--lower_is_worse", action="store_true")
         self.add_argument("--lr_scheduler_patience", type=int, default=None)
         self.add_argument("--early_stopping_patience", type=int, default=None)
+        self.add_argument("--max_norm", type=float, default=1.0)
 
 
 class EarlyStopper:
@@ -101,8 +103,6 @@ class Trainer(ABC):
 
     OVERWRITE_OUTDIRS = ("tmp", "test")
     tr_metric_keys = ("tr_loss", "tr_time")
-    vl_metric_keys = ("vl_loss", "vl_time")
-    other_keys = ("epoch", "learning_rate")
 
     def __init__(
         self,
@@ -201,66 +201,52 @@ class Trainer(ABC):
     def train(self) -> dict[str, float]:
         t_0 = time.time()
 
-        # Collect the results of each metric for each batch
         results: defaultdict[str, list[float]] = defaultdict(list)
-
         self.model.train()
         dataloader = self.get_tr_dataloader()
         pbar = self._get_pbar(dataloader, total=len(self.tr_dataset) // self.args.tr_batch_size)
         for step, batch in enumerate(pbar):
-            # Get the average of each metric for the batch.
-            result = self.train_one_batch(batch)
-            for k, v in result.items():
-                r = mean(v) if isinstance(v, list) else v
-                results[k].append(r)
 
-            # Print the average of the most recent `logging_steps`
+            self.model.zero_grad()
+            outputs = self.forward(batch)
+            loss, losses = self.compute_loss(batch, outputs)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm, error_if_nonfinite=True)
+            self.optimizer.step()
+
+            results["tr_loss"].append(loss.item())
+            for k, v in losses.items():
+                results[f"tr_{k}"].append(v)
             if self.args.logging_steps > 0 and step % self.args.logging_steps == 0:
-                d = {}
-                for k, v in results.items():
-                    v = v[-self.args.logging_steps:]
-                    d[f"_{k}"] = mean(v)
+                d = {"_tr_loss": mean(results["tr_loss"][-self.args.logging_steps:])}
                 print(self._fmt_dict(d))
 
-        # Get the average of each metric for the entire training set
         for k, v in results.items():
             results[k] = mean(v)
         results["tr_time"] = time.time() - t_0
 
         return dict(results)
 
-    @abstractmethod
-    def train_one_batch(self, batch: tuple) -> dict[str, float | list[float]]:
-        """Update the model on a batch of examples.
-
-        Args:
-            batch (tuple): batch of inputs.
-
-        Returns:
-            dict[str, float | list[float]]: dictionary of metrics, which may be a single value,
-                representing an average over the batch, or a list of values, representing the
-                value of the metric for each sample (will be averaged by self.train). "tr_loss"
-                must be a key returned by the dictionary.
-        """
-
     def evaluate(self) -> dict[str, float]:
         t_0 = time.time()
 
-        # Collect the results of each metric for each batch
         results: defaultdict[str, list[float]] = defaultdict(list)
-
         self.model.eval()
         dataloader = self.get_vl_dataloader()
         pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size)
         with torch.no_grad():
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
-                # Get the average of each metric for the batch.
-                result = self.evaluate_one_batch(batch)
-                for k, v in result.items():
-                    r = mean(v) if isinstance(v, list) else v
-                    results[k].append(r)
 
-        # Get the average of each metric for the entire validation set
+                outputs = self.forward(batch)
+                loss, losses = self.compute_loss(batch, outputs)
+                metrics = self.compute_metrics(batch, outputs)
+
+                results["vl_loss"].append(loss.item())
+                for k, v in losses.items():
+                    results[f"vl_{k}"].append(v)
+                for k, v in metrics.items():
+                    results[f"vl_{k}"].append(v)
+
         for k, v in results.items():
             results[k] = mean(v)
         results["vl_time"] = time.time() - t_0
@@ -268,18 +254,41 @@ class Trainer(ABC):
         return dict(results)
 
     @abstractmethod
-    def evaluate_one_batch(self, batch: tuple) -> dict[str, float | list[float]]:
-        """Evaluate the model on a batch of examples.
+    def forward(self, batch: tuple) -> tuple:
+        """Send a batch of inputs forward through the model.
 
         Args:
             batch (tuple): batch of inputs.
 
         Returns:
-            dict[str, float | list[float]]: dictionary of metrics, which may be a single value,
-                representing an average over the batch, or a list of values, representing the
-                value of the metric for each sample (will be averaged by self.train). "vl_loss"
-                must be a key returned by the dictionary.
+            tuple: model output(s), e.g., logits.
         """
+
+    @abstractmethod
+    def compute_loss(self, batch: tuple, outputs: tuple) -> tuple[Tensor, dict[str, float]]:
+        """Compute the loss over a batch of examples.
+
+        Args:
+            batch (tuple): batch of inputs.
+            outputs (tuple): model output(s), e.g., logits, as return by self.forward.
+
+        Returns:
+            Tensor: loss over the batch.
+            dict[str, float]: auxillary losses over the batch.
+        """
+
+    def compute_metrics(self, batch: tuple, outputs: tuple) -> dict[str, float]:
+        """Compute the validation metrics over a batch of examples.
+
+        Args:
+            batch (tuple): batch of inputs.
+            outputs (tuple): model output(s), e.g., logits, as return by self.forward.
+            loss (Tensor): model loss over the batch.
+
+        Returns:
+            dict[str, float]: metrics for the batch.
+        """
+        return {}
 
     def get_dataloader(self, dataset: Dataset | IterableDataset, batch_size: int, shuffle: bool) -> DataLoader:
         return DataLoader(

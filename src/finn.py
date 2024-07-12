@@ -503,7 +503,6 @@ class FINNTrainer(Trainer):
     collate_fn: FINNCollateFn
     loss_fn: FINNLossFn
     tr_metric_keys = ("tr_loss", "tr_enc_loss", "tr_dec_loss", "tr_time",)
-    vl_metric_keys = ("vl_loss", "vl_enc_loss", "vl_dec_loss", "vl_bit_error_rate", "vl_extraction_rate", "vl_time",)
 
     def create_scheduler(self) -> None:
         return None
@@ -511,36 +510,28 @@ class FINNTrainer(Trainer):
     def create_stopper(self) -> None:
         return None
 
-    def train_one_batch(self, batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> dict[str, float]:
-
+    def forward(self, batch: tuple[Tensor, Tensor, Tensor, Optional[Tensor]]) -> tuple[Tensor, Tensor]:
         fingerprint: Tensor = batch[0].to(self.args.device)
         ipd: Tensor = batch[1].to(self.args.device)
-        delay: Tensor = batch[2].to(self.args.device)
-        noise_1: Tensor = batch[3].to(self.args.device)
-        noise_2: Optional[Tensor] = batch[4].to(self.args.device) if batch[4] is not None else None
-
-        self.model.zero_grad()
-        delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise_1, noise_2)
-        weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
-        weighted_loss.backward()
-        self.optimizer.step()
-
-        return {
-            "tr_loss": weighted_loss.item(),
-            "tr_enc_loss": encoder_loss.item(),
-            "tr_dec_loss": decoder_loss.item(),
-        }
-
-    def evaluate_one_batch(self, batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> dict[str, float]:
-
-        fingerprint: Tensor = batch[0].to(self.args.device)
-        ipd: Tensor = batch[1].to(self.args.device)
-        delay: Tensor = batch[2].to(self.args.device)
         noise_1: Tensor = batch[3].to(self.args.device)
         noise_2: Optional[Tensor] = batch[4].to(self.args.device) if batch[4] is not None else None
 
         delay_pred, fingerprint_pred = self.model.forward(fingerprint, ipd, noise_1, noise_2)
-        weighted_loss, encoder_loss, decoder_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
+        return delay_pred, fingerprint_pred
+
+    def compute_loss(self, batch: tuple[Tensor, Tensor, Tensor, Optional[Tensor]], outputs: tuple[Tensor, Tensor]) -> tuple[Tensor, dict[str, float]]:
+        fingerprint: Tensor = batch[0].to(self.args.device)
+        delay: Tensor = batch[2].to(self.args.device)
+        delay_pred = outputs[0].to(self.args.device)
+        fingerprint_pred = outputs[1].to(self.args.device)
+
+        loss, enc_loss, dec_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
+        return loss, {"enc_loss": enc_loss.item(), "dec_loss": dec_loss.item()}
+
+    def compute_metrics(self, batch: tuple[Tensor, Tensor, Tensor, Optional[Tensor]], outputs: tuple[Tensor, Tensor]) -> dict[str, float]:
+        fingerprint = batch[0].to(self.args.device)
+        fingerprint_pred = outputs[1].to(self.args.device)
+
         predictions = F.softmax(fingerprint_pred, dim=-1)
 
         # Compute the bit-error rate.
@@ -557,13 +548,7 @@ class FINNTrainer(Trainer):
         y_pred = torch.argmax(predictions, dim=1).tolist()
         accuracy = accuracy_score(y_true, y_pred)
 
-        return {
-            "vl_loss": weighted_loss.item(),
-            "vl_enc_loss": encoder_loss.item(),
-            "vl_dec_loss": decoder_loss.item(),
-            "vl_bit_error_rate": bit_error_rate.item(),
-            "vl_extraction_rate": accuracy,
-        }
+        return {"bit_error_rate": bit_error_rate.item(), "extraction_rate": accuracy}
 
 
 def main():

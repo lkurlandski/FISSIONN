@@ -367,38 +367,27 @@ class ApproximatorTrainer(Trainer):
     collate_fn: ApproximatorCollateFn
     loss_fn: ApproximatorLossFn
 
-    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> dict[str, float]:
+    def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-
-        self.model.zero_grad()
         y_pred = self.model.forward(x, y[:, :-1])
         y_pred = y_pred[:, 1:] if y_pred.size(1) == y.size(1) else y_pred  # trim for recurrent models
+        return (y_pred,)
+
+    def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
+        y: Tensor = batch[1].to(self.args.device)
+        y_pred: Tensor = outputs[0]
         loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
-        loss.backward()
-        self.optimizer.step()
-
-        return {"tr_loss": loss.item()}
-
-    def evaluate_one_batch(self, batch: tuple[Tensor, Tensor]) -> dict[str, float]:
-        x: Tensor = batch[0].to(self.args.device)
-        y: Tensor = batch[1].to(self.args.device)
-
-        y_pred = self.model.forward(x, y[:, :-1])
-        y_pred = y_pred[:, 1:] if y_pred.size(1) == y.size(1) else y_pred  # trim for recurrent models
-        loss = self.loss_fn.forward(y_pred, y[:, 1:])
-
-        return {"vl_loss": loss.item()}
+        return loss, {}
 
 
 def main() -> None:
 
-    MAX_LENGTH = 256
-
     parser = TrainerArgumentParser()
+    parser.add_argument("--max_length", type=int, default=64, help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--arch", type=str, default="transformer", choice=["transformer", "rnn", "lstm", "gru"], help=".")
-    parser.add_argument("--arch_config", type=str, default="puny", choice=["puny", "tiny", "small", "medium", "large", "huge"], help=".")
+    parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "rnn", "lstm", "gru"], help=".")
+    parser.add_argument("--arch_config", type=str, default="puny", choices=["puny", "tiny", "small", "medium", "large", "huge"], help=".")
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
     args = parser.parse_args()
@@ -440,7 +429,7 @@ def main() -> None:
     print(f"Decoder Parameters: {round(count_parameters(model.decoder) / 1e6, 2)}M")
     print("-" * 80)
 
-    collate_fn = ApproximatorCollateFn(max_length=MAX_LENGTH)
+    collate_fn = ApproximatorCollateFn(max_length=args.max_length)
     loss_fn = ApproximatorLossFn()
     trainer_args = TrainerArgs(
         outdir=args.outdir,
