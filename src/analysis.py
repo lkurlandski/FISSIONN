@@ -2,6 +2,7 @@
 Analyze the output of the FINNTrainer.
 """
 
+from argparse import ArgumentParser
 import json
 from pathlib import Path
 import os
@@ -77,15 +78,12 @@ class FINNTrainerAnalyzer:
 
 
 def main() -> None:
-    # analyzer = FINNTrainerAnalyzer("output/E1-0--200000--16384")
-    # analyzer()
-    # analyzer.plot()
 
-    # analyzer = FINNTrainerAnalyzer("output/E1-1--200000--16384")
-    # analyzer()
-    # analyzer.plot()
+    parser = ArgumentParser()
+    parser.add_argument("--outdir", type=Path, required=True)
+    args = parser.parse_args()
 
-    analyzer = FINNTrainerAnalyzer("output/E1-2--200000--16384")
+    analyzer = FINNTrainerAnalyzer(args.outdir)
     analyzer()
     analyzer.plot()
 
