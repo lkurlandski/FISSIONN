@@ -438,7 +438,7 @@ class FINNDecoder(nn.Module):
 
 class FINNModel(nn.Module):
 
-    def __init__(self, fingerprint_length: int, flow_length: int) -> None:
+    def __init__(self, fingerprint_length: int, flow_length: int, no_encoding_noise: bool = False) -> None:
         """
         Args:
           fingerprint_length: int - The size of the fingerprint tensor.
@@ -447,7 +447,9 @@ class FINNModel(nn.Module):
         super().__init__()
         self.fingerprint_length = fingerprint_length
         self.flow_length = flow_length
-        self.encoder = FINNEncoder(fingerprint_length + flow_length, flow_length)
+        self.no_encoding_noise = no_encoding_noise
+        encoder_input_size = fingerprint_length if no_encoding_noise else fingerprint_length + flow_length
+        self.encoder = FINNEncoder(encoder_input_size, flow_length)
         self.decoder = FINNDecoder(flow_length, fingerprint_length)
 
     def forward(self, fingerprint: Tensor, ipd: Tensor, noise_1: Tensor, noise_2: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
@@ -472,8 +474,12 @@ class FINNModel(nn.Module):
         if noise_2.dim() != 2 or noise_2.shape[1] != self.flow_length:
             raise ShapeError(noise_2.shape, ("*", self.flow_length))
 
-        fingerprint_and_noise = torch.cat((fingerprint, noise_1), dim=1)
-        delay_pred = self.encoder.forward(fingerprint_and_noise)
+        if self.no_encoding_noise:
+            encoder_input = fingerprint
+        else:
+            encoder_input = torch.cat((fingerprint, noise_1), dim=1)
+
+        delay_pred = self.encoder.forward(encoder_input)
         noisy_marked_ipd = self.combine_3(ipd, delay_pred, noise_2)
         fingerprint_pred = self.decoder(noisy_marked_ipd)
 
@@ -498,6 +504,12 @@ class FINNTrainer(Trainer):
     loss_fn: FINNLossFn
     tr_metric_keys = ("tr_loss", "tr_enc_loss", "tr_dec_loss", "tr_time",)
     vl_metric_keys = ("vl_loss", "vl_enc_loss", "vl_dec_loss", "vl_bit_error_rate", "vl_extraction_rate", "vl_time",)
+
+    def create_scheduler(self) -> None:
+        return None
+
+    def create_stopper(self) -> None:
+        return None
 
     def train_one_batch(self, batch: tuple[Tensor, Tensor, Tensor, Tensor]) -> dict[str, float]:
 
@@ -574,6 +586,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help=".")
     parser.add_argument("--dynamic", action="store_true", help=".")
     parser.add_argument("--use_same_dataset", action="store_true", help=".")
+    parser.add_argument("--no_encoding_noise", action="store_true", help=".")
     parser.add_argument("--use_different_noises", action="store_true", help=".")
     parser.add_argument("--demo", action="store_true", help=".")
     args = parser.parse_args()
@@ -621,7 +634,7 @@ def main():
     print(f"Validation Dataset:\n{vl_dataset}")
     print("-" * 80)
 
-    model = FINNModel(args.fingerprint_length, args.flow_length)
+    model = FINNModel(args.fingerprint_length, args.flow_length, args.no_encoding_noise)
     print(f"Model:\n{model}")
     print(f"Total Parameters: {round(count_parameters(model) / 1e6, 2)}M")
     print(f"Encoder Parameters: {round(count_parameters(model.encoder) / 1e6, 2)}M")
