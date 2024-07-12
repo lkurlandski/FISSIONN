@@ -61,7 +61,7 @@ from src.utils import (
 # pylint: enable=wrong-import-position
 
 
-class FINNDataset(Dataset, ABC):
+class FinnDataset(Dataset, ABC):
     # TODO: the manner to produce noise is a tad ambigious.
     # This implementation uses a uniform distribution to sample the noise deviation.
     # This noise deviation is then used as the `scale` of the Laplace distribition to sample the noise.
@@ -174,7 +174,7 @@ class FINNDataset(Dataset, ABC):
         ...
 
 
-class DynamicFINNDataset(FINNDataset):
+class DynamicFinnDataset(FinnDataset):
 
     @property
     def memory_size(self) -> int:
@@ -201,7 +201,7 @@ class DynamicFINNDataset(FINNDataset):
         return self._get_noise(len(ipd))
 
 
-class StaticFINNDataset(FINNDataset):
+class StaticFinnDataset(FinnDataset):
 
     def __post_init__(self) -> None:
         iterable = tqdm(self.ipds, total=len(self), desc="Generating Fingerprints...")
@@ -251,7 +251,7 @@ class StaticFINNDataset(FINNDataset):
         return self.noises_2[idx]
 
 
-class FINNCollateFn:
+class FinnCollateFn:
 
     def __init__(
         self,
@@ -296,7 +296,7 @@ class FINNCollateFn:
         raise ValueError(f"Invalid padding option: {self.padding}")
 
 
-class FINNLossFn(nn.Module):
+class FinnLossFn(nn.Module):
 
     def __init__(
         self,
@@ -343,7 +343,7 @@ class FINNLossFn(nn.Module):
         return self.decoder_weight * self.decoder_loss_fn(decoder_logits, decoder_labels)  # argmax?
 
 
-class FINNEncoder(nn.Module):
+class FinnEncoder(nn.Module):
     # TODO: There is ambiguity about what the input to the encoder is.
     # Eequation 1 indicates that the input to the encoder is the fingerprint
     # concatenated with the network noise, but the first paragraph in
@@ -387,7 +387,7 @@ class FINNEncoder(nn.Module):
         return x
 
 
-class FINNDecoder(nn.Module):
+class FinnDecoder(nn.Module):
     # TODO: Should the CNN layers be 2D CNNs? The paper seems to indicate this,
     # but such a choice is unusual given the nature of the decoder input.
 
@@ -436,7 +436,7 @@ class FINNDecoder(nn.Module):
         return x
 
 
-class FINNModel(nn.Module):
+class FinnModel(nn.Module):
 
     def __init__(self, fingerprint_length: int, flow_length: int, no_encoding_noise: bool = False) -> None:
         """
@@ -449,8 +449,8 @@ class FINNModel(nn.Module):
         self.flow_length = flow_length
         self.no_encoding_noise = no_encoding_noise
         encoder_input_size = fingerprint_length if no_encoding_noise else fingerprint_length + flow_length
-        self.encoder = FINNEncoder(encoder_input_size, flow_length)
-        self.decoder = FINNDecoder(flow_length, fingerprint_length)
+        self.encoder = FinnEncoder(encoder_input_size, flow_length)
+        self.decoder = FinnDecoder(flow_length, fingerprint_length)
 
     def forward(self, fingerprint: Tensor, ipd: Tensor, noise_1: Tensor, noise_2: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
         """
@@ -495,13 +495,13 @@ class FINNModel(nn.Module):
         return ipd + torch.cumsum(delay, dim=1) + torch.cumsum(noise, dim=1)
 
 
-class FINNTrainer(Trainer):
+class FinnTrainer(Trainer):
 
-    model: FINNModel
-    tr_dataset: FINNDataset
-    vl_dataset: FINNDataset
-    collate_fn: FINNCollateFn
-    loss_fn: FINNLossFn
+    model: FinnModel
+    tr_dataset: FinnDataset
+    vl_dataset: FinnDataset
+    collate_fn: FinnCollateFn
+    loss_fn: FinnLossFn
     tr_metric_keys = ("tr_loss", "tr_enc_loss", "tr_dec_loss", "tr_time",)
 
     def create_scheduler(self) -> None:
@@ -600,7 +600,7 @@ def main():
     print(f"Validation Size: {len(vl_ipds)}. Mean Length: {np.mean([len(ipd) for ipd in vl_ipds])}")
     print("-" * 80)
 
-    DatasetConstructor = DynamicFINNDataset if args.dynamic else StaticFINNDataset
+    DatasetConstructor = DynamicFinnDataset if args.dynamic else StaticFinnDataset
     DatasetConstructor = partial(
         DatasetConstructor,
         fingerprint_length=args.fingerprint_length,
@@ -619,7 +619,7 @@ def main():
     print(f"Validation Dataset:\n{vl_dataset}")
     print("-" * 80)
 
-    model = FINNModel(args.fingerprint_length, args.flow_length, args.no_encoding_noise)
+    model = FinnModel(args.fingerprint_length, args.flow_length, args.no_encoding_noise)
     print(f"Model:\n{model}")
     print(f"Total Parameters: {round(count_parameters(model) / 1e6, 2)}M")
     print(f"Encoder Parameters: {round(count_parameters(model.encoder) / 1e6, 2)}M")
@@ -637,9 +637,9 @@ def main():
         disable_tqdm=args.disable_tqdm,
         logging_steps=args.logging_steps,
     )
-    collate_fn = FINNCollateFn(args.fingerprint_length, args.flow_length, "max", truncate=True)
-    loss_fn = FINNLossFn(encoder_weight=args.encoder_loss_weight, decoder_weight=args.decoder_loss_weight)
-    trainer = FINNTrainer(trainer_args, model, tr_dataset, vl_dataset, collate_fn, loss_fn)
+    collate_fn = FinnCollateFn(args.fingerprint_length, args.flow_length, "max", truncate=True)
+    loss_fn = FinnLossFn(encoder_weight=args.encoder_loss_weight, decoder_weight=args.decoder_loss_weight)
+    trainer = FinnTrainer(trainer_args, model, tr_dataset, vl_dataset, collate_fn, loss_fn)
 
     trainer()
 
