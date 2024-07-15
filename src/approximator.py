@@ -3,13 +3,14 @@ A network to approximate the noising process of IPDs through SSI chains.
 """
 
 from __future__ import annotations
+from collections.abc import Iterable
 from itertools import chain, combinations
 import math
 import os
 from pprint import pformat
 from statistics import mean
 import sys
-from typing import Literal, Optional
+from typing import Generator, Literal, Optional
 
 from sklearn.model_selection import train_test_split
 import torch
@@ -47,13 +48,11 @@ def eos(shape: tuple[int]) -> Tensor:
 
 class ApproximatorDataset(Dataset):
 
-    def __init__(self, ipd_groups: list[list[list[int]]]) -> None:
-        self.ipd_pairs = chain.from_iterable(combinations(ipd_group, 2) for ipd_group in ipd_groups)
-        self.ipd_pairs: list[tuple[list[int], list[int]]] = list(self.ipd_pairs)
+    def __init__(self, ipd_pairs: Iterable[tuple[list[float], list[float]]]) -> None:
+        self.ipd_pairs = [(torch.tensor(ipd_a), torch.tensor(ipd_b)) for ipd_a, ipd_b in ipd_pairs]
 
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
-        x, y = self.ipd_pairs[idx]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        return self.ipd_pairs[idx]
 
     def __len__(self) -> int:
         return len(self.ipd_pairs)
@@ -67,28 +66,25 @@ class ApproximatorDataset(Dataset):
     def __str__(self) -> str:
         return repr(self)
 
+    @staticmethod
+    def build_pairs_from_single_hops(ipd_groups: list[list[list[float]]]) -> Generator[tuple[list[float], list[float]]]:
+        """A pair consists of a IPD sequence and the IPD sequence following a single hop."""
+        for group in ipd_groups:
+            for i in range(len(group) - 1):
+                yield group[i], group[i + 1]
 
-def compute_basal_loss(
-    ipd_groups: list[list[list[int]]],
-    max_length: int,
-    device: Optional[torch.cuda.device] = None,
-    batch_size: int = 4096,
-) -> float:
-    """
-    This gives misleading values.
-    """
-    dataset = ApproximatorDataset(ipd_groups)
-    collate_fn = ApproximatorCollateFn(max_length)
-    loss_fn = ApproximatorLossFn()
-    dataloader = DataLoader(dataset, batch_size, False, collate_fn=collate_fn, drop_last=True)
-    pbar = tqdm(dataloader, desc="Computing Basal Loss...")
-    losses = []
-    for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
-        x = batch[0].to(device)
-        y = batch[1].to(device)
-        loss = loss_fn.forward(x, y).item()
-        losses.append(loss)
-    return mean(losses)
+    @staticmethod
+    def build_pairs_from_hops(ipd_groups: list[list[list[float]]]) -> Generator[tuple[list[float], list[float]]]:
+        """A pair consists of a IPD sequence and the IPD sequence following any number of hops."""
+        for group in ipd_groups:
+            for ipd_1, ipd_2 in combinations(group, 2):
+                yield ipd_1, ipd_2
+
+    @staticmethod
+    def build_pairs_from_chains(ipd_groups: list[list[list[float]]]) -> Generator[tuple[list[float], list[float]]]:
+        """A pair consists of a IPD sequence and the IPD sequence following a chain of hops."""
+        for group in ipd_groups:
+            yield group[0], group[-1]
 
 
 class ApproximatorCollateFn:
@@ -407,9 +403,9 @@ def main() -> None:
     print("-" * 80)
 
     tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
-    tr_dataset = ApproximatorDataset(tr_ipd_groups)
+    tr_dataset = ApproximatorDataset(ApproximatorDataset.build_pairs_from_single_hops(tr_ipd_groups))
     tr_dataset = Subset(tr_dataset, range(min(args.tr_num_samples, len(tr_dataset))))
-    vl_dataset = ApproximatorDataset(vl_ipd_groups)
+    vl_dataset = ApproximatorDataset(ApproximatorDataset.build_pairs_from_single_hops(vl_ipd_groups))
     vl_dataset = Subset(vl_dataset, range(min(args.vl_num_samples, len(vl_dataset))))
 
     print(f"Training Dataset: {tr_dataset}")
