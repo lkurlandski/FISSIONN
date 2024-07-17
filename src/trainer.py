@@ -171,7 +171,10 @@ class Trainer(ABC):
             self.update_best(d)
             self.update_save(d)
             if self.scheduler is not None:
-                self.scheduler.step(vl_metrics[self.args.metric])
+                if isinstance(self.scheduler, ReduceLROnPlateau):
+                    self.scheduler.step(vl_metrics[self.args.metric], epoch=None)
+                else:
+                    self.scheduler.step(epoch=None)
             if self.stopper is not None:
                 self.stopper.step(vl_metrics[self.args.metric])
                 if self.stopper.stop:
