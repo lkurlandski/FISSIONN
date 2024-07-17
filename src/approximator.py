@@ -7,16 +7,18 @@ from collections.abc import Iterable
 from itertools import chain, combinations
 import math
 import os
+from pathlib import Path
 from pprint import pformat
 from statistics import mean
 import sys
-from typing import Generator, Literal, Optional
+from typing import Callable, Generator, Literal, Optional, Self
 
 from sklearn.model_selection import train_test_split
 import torch
+from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
 from torch import nn, Tensor, BoolTensor
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, Subset
 from tqdm import tqdm
 
 # pylint: disable=wrong-import-position
@@ -85,6 +87,13 @@ class ApproximatorDataset(Dataset):
         """A pair consists of a IPD sequence and the IPD sequence following a chain of hops."""
         for group in ipd_groups:
             yield group[0], group[-1]
+
+
+BUILDER_PAIR_MODES: dict[str, Callable[[list[list[list[float]]]], Generator[tuple[list[float], list[float]]]]] = {
+    "single_hops": ApproximatorDataset.build_pairs_from_single_hops,
+    "hops": ApproximatorDataset.build_pairs_from_hops,
+    "chains": ApproximatorDataset.build_pairs_from_chains,
+}
 
 
 class ApproximatorCollateFn:
@@ -363,6 +372,12 @@ class ApproximatorTrainer(Trainer):
     collate_fn: ApproximatorCollateFn
     loss_fn: ApproximatorLossFn
 
+    def create_scheduler(self) -> Optional[LRScheduler]:
+        return ExponentialLR(self.optimizer, gamma=0.75)
+
+    def create_stopper(self) -> None:
+        return None
+
     def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
@@ -377,6 +392,29 @@ class ApproximatorTrainer(Trainer):
         return loss, {}
 
 
+class OutputHelper:
+
+    def __init__(self, root: Path, pair_mode: str, arch: str, arch_config: str, max_length: int) -> None:
+        self.root = root
+        self.pair_mode = pair_mode
+        self.arch = arch
+        self.arch_config = arch_config
+        self.max_length = max_length
+
+    @property
+    def path(self) -> Path:
+        args = [
+            f"pair_mode--{self.pair_mode}",
+            f"arch--{self.arch}",
+            f"arch_config--{self.arch_config}",
+            f"max_length--{self.max_length}",
+        ]
+        return Path(self.root).joinpath(*args) / "results"
+
+    def mkdir(self) -> None:
+        self.path.mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
 
     parser = TrainerArgumentParser()
@@ -384,6 +422,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help=".")
     parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "rnn", "lstm", "gru"], help=".")
     parser.add_argument("--arch_config", type=str, default="puny", choices=["puny", "tiny", "small", "medium", "large", "huge"], help=".")
+    parser.add_argument("--pair_mode", type=str, default="single_hops", choices=["single_hops", "hops", "chains"], help=".")
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
     args = parser.parse_args()
@@ -391,8 +430,9 @@ def main() -> None:
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
     print("-" * 80)
 
-    if args.outdir.exists() and args.outdir.name not in Trainer.OVERWRITE_OUTDIRS:
-        raise FileExistsError(f"Output Directory Already Exists: {args.outdir}")
+    oh = OutputHelper(args.outdir, args.pair_mode, args.arch, args.arch_config, args.max_length)
+    if oh.path.exists() and args.outdir.name not in Trainer.OVERWRITE_OUTDIRS:
+        raise FileExistsError(f"Output Directory Already Exists: {oh.path}")
 
     seed_everything(args.seed)
 
@@ -403,9 +443,10 @@ def main() -> None:
     print("-" * 80)
 
     tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
-    tr_dataset = ApproximatorDataset(ApproximatorDataset.build_pairs_from_single_hops(tr_ipd_groups))
+    build_pairs_fn = BUILDER_PAIR_MODES[args.pair_mode]
+    tr_dataset = ApproximatorDataset(build_pairs_fn(tr_ipd_groups))
     tr_dataset = Subset(tr_dataset, range(min(args.tr_num_samples, len(tr_dataset))))
-    vl_dataset = ApproximatorDataset(ApproximatorDataset.build_pairs_from_single_hops(vl_ipd_groups))
+    vl_dataset = ApproximatorDataset(build_pairs_fn(vl_ipd_groups))
     vl_dataset = Subset(vl_dataset, range(min(args.vl_num_samples, len(vl_dataset))))
 
     print(f"Training Dataset: {tr_dataset}")
@@ -428,7 +469,7 @@ def main() -> None:
     collate_fn = ApproximatorCollateFn(max_length=args.max_length)
     loss_fn = ApproximatorLossFn()
     trainer_args = TrainerArgs(
-        outdir=args.outdir,
+        outdir=oh.path,
         device=args.device,
         epochs=args.epochs,
         tr_batch_size=args.tr_batch_size,
@@ -437,6 +478,7 @@ def main() -> None:
         num_workers=args.num_workers,
         disable_tqdm=args.disable_tqdm,
         logging_steps=args.logging_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     trainer = ApproximatorTrainer(
         trainer_args,
