@@ -1,5 +1,33 @@
 """
 A network to approximate the noising process of IPDs through SSI chains.
+
+Overflow Issue
+--------------
+
+Pytorch's TransformerEncoder seems to have some issues with numerical instability.
+Training the tiny and small Transformer models results in NaN loss values. Using
+
+```
+torch.autograd.set_anomaly_detection(True)
+```
+
+reveals the root cause of the issue to be a RuntimeError"
+
+'''
+Function 'ScaledDotProductEfficientAttentionBackward0' returned nan values in its 0th output.
+'''
+
+This is a documented problem in pytorch, although it was supposedly fixed for 2.3.1
+(https://github.com/pytorch/pytorch/issues/119320). The workaround is to the use the
+SDPBackend.MATH backend instead of the SDPBackend.EFFICIENT_ATTENTION backend:
+
+```
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+with sdpa_kernel(SDPBackend.MATH):
+    ...
+```
+
 """
 
 from __future__ import annotations
@@ -17,6 +45,7 @@ from sklearn.model_selection import train_test_split
 import torch
 from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
 from torch import nn, Tensor, BoolTensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Subset
 from tqdm import tqdm
@@ -33,6 +62,10 @@ from src.utils import (
     ShapeError,
 )
 # pylint: enable=wrong-import-position
+
+
+# TODO: improve upon this solution
+BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
 
 PAD = -10000.0
@@ -372,6 +405,10 @@ class ApproximatorTrainer(Trainer):
     collate_fn: ApproximatorCollateFn
     loss_fn: ApproximatorLossFn
 
+    def __call__(self) -> Self:
+        with sdpa_kernel(BACKEND):
+            return super().__call__()
+
     def create_scheduler(self) -> Optional[LRScheduler]:
         return ExponentialLR(self.optimizer, gamma=0.75)
 
@@ -417,6 +454,8 @@ class OutputHelper:
 
 def main() -> None:
 
+    global BACKEND
+
     parser = TrainerArgumentParser()
     parser.add_argument("--max_length", type=int, default=64, help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
@@ -456,6 +495,8 @@ def main() -> None:
     if args.arch == "transformer":
         config = {"max_length": args.max_length} | getattr(TransformerApproximator, args.arch_config.upper())
         model = TransformerApproximator(**config)
+        if args.arch_config in ("tiny", "small"):
+            BACKEND = SDPBackend.MATH
     else:
         config = getattr(RecurrentApproximator, args.arch_config.upper())
         model = RecurrentApproximator(**config)
