@@ -136,11 +136,7 @@ class Trainer(ABC):
         return None
 
     def __call__(self) -> Self:
-        if self.args.outdir.exists():
-            if self.args.outdir.name in self.OVERWRITE_OUTDIRS:
-                shutil.rmtree(self.args.outdir)
-            else:
-                raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
+        shutil.rmtree(self.args.outdir, ignore_errors=True)
         self.args.outdir.mkdir(parents=True, exist_ok=True)
 
         @find_executable_batch_size(
@@ -161,6 +157,10 @@ class Trainer(ABC):
             self.args.tr_batch_size = batch_size
             self.args.gradient_accumulation_steps = gradient_accumulation_steps
             return self.train()
+
+        if not self.args.find_executable_batch_size:
+            evaluate = self.evaluate
+            train = self.train
 
         tr_metrics = {k: float("nan") for k in self.tr_metric_keys}
         vl_metrics = evaluate()
@@ -244,8 +244,8 @@ class Trainer(ABC):
             condition_2 = (mini_step + 1) == len(dataloader)
             if condition_1 or condition_2:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
-                self.optimizer.zero_grad()
                 self.optimizer.step()
+                self.optimizer.zero_grad()
                 step += 1
 
             # Perform logging every `logging_steps` `steps`

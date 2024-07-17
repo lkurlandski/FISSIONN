@@ -470,8 +470,6 @@ def main() -> None:
     print("-" * 80)
 
     oh = OutputHelper(args.outdir, args.pair_mode, args.arch, args.arch_config, args.max_length)
-    if oh.path.exists() and args.outdir.name not in Trainer.OVERWRITE_OUTDIRS:
-        raise FileExistsError(f"Output Directory Already Exists: {oh.path}")
 
     seed_everything(args.seed)
 
