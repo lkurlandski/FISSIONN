@@ -18,6 +18,7 @@ from statistics import mean
 import sys
 import time
 from typing import Callable, Optional, Self
+import warnings
 
 import torch
 from torch import Tensor
@@ -205,7 +206,6 @@ class Trainer(ABC):
 
         self.model.train()
         dataloader = self.get_tr_dataloader()
-
         num_steps = math.ceil(len(dataloader) / self.args.gradient_accumulation_steps)
         results: defaultdict[str, list[float]] = defaultdict(lambda: [0] * num_steps)
         step = 0
@@ -213,12 +213,14 @@ class Trainer(ABC):
         pbar = self._get_pbar(dataloader, total=len(dataloader))
         for mini_step, batch in enumerate(pbar):
 
-            # Compute normalized loss
-            self.model.zero_grad()
+            # Compute normalized loss, skip noisy losses
             outputs = self.forward(batch)
             loss, losses = self.compute_loss(batch, outputs)
             loss = loss / self.args.gradient_accumulation_steps
             losses = {k: v / self.args.gradient_accumulation_steps for k, v in losses.items()}
+            if math.isnan(loss.item()) or math.isinf(loss.item()):
+                warnings.warn(f"NaN/Inf Loss Detected! {mini_step=} loss={loss.item()}")
+                continue  # TODO: could theoretically cause the weights to never step
             loss.backward()
 
             # Add to running metrics
@@ -231,6 +233,7 @@ class Trainer(ABC):
             condition_2 = (mini_step + 1) == len(dataloader)
             if condition_1 or condition_2:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
+                self.optimizer.zero_grad()
                 self.optimizer.step()
                 step += 1
 
