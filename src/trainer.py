@@ -42,8 +42,6 @@ class TrainerArgs:
     logging_steps: int = -1
     metric: str = "vl_loss"
     lower_is_worse: bool = False
-    lr_scheduler_patience: Optional[int] = None
-    early_stopping_patience: Optional[int] = None
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
 
@@ -63,8 +61,6 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--logging_steps", type=int, default=-1)
         self.add_argument("--metric", type=str, default="vl_loss")
         self.add_argument("--lower_is_worse", action="store_true")
-        self.add_argument("--lr_scheduler_patience", type=int, default=None)
-        self.add_argument("--early_stopping_patience", type=int, default=None)
         self.add_argument("--max_norm", type=float, default=1.0)
         self.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
@@ -133,18 +129,10 @@ class Trainer(ABC):
         return AdamW(self.model.parameters(), lr=self.args.learning_rate)
 
     def create_scheduler(self) -> Optional[LRScheduler]:
-        # Patience varies between [0, 10] and will be one less than the stopper's patience.
-        patience = self.args.lr_scheduler_patience
-        if patience is None:
-            patience = min(100000 // len(self.tr_dataset), 10)
-        return ReduceLROnPlateau(self.optimizer, min_lr=1e-6, patience=patience)
+        return None
 
     def create_stopper(self) -> Optional[EarlyStopper]:
-        # Patience varies between [1, 11] and will be one greater than the scheduler's patience.
-        patience = self.args.early_stopping_patience
-        if patience is None:
-            patience = min(100000 // len(self.tr_dataset) + 1, 11)
-        return EarlyStopper(patience, threshold=1e-6, lower_is_worse=self.args.lower_is_worse)
+        return None
 
     def __call__(self) -> Self:
         if self.args.outdir.exists():
@@ -172,7 +160,7 @@ class Trainer(ABC):
             self.update_save(d)
             if self.scheduler is not None:
                 if isinstance(self.scheduler, ReduceLROnPlateau):
-                    self.scheduler.step(vl_metrics[self.args.metric], epoch=None)
+                    self.scheduler.step(metrics=vl_metrics[self.args.metric], epoch=None)
                 else:
                     self.scheduler.step(epoch=None)
             if self.stopper is not None:
