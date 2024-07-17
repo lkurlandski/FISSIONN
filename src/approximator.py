@@ -520,6 +520,7 @@ def main() -> None:
         disable_tqdm=args.disable_tqdm,
         logging_steps=args.logging_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        find_executable_batch_size=args.find_executable_batch_size,
     )
     trainer = ApproximatorTrainer(
         trainer_args,

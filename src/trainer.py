@@ -1,8 +1,5 @@
 """
 Basic training utilities.
-
-TODO:
- - Add support for better saving/loading of models.
 """
 
 from abc import ABC, abstractmethod
@@ -28,6 +25,8 @@ from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from tqdm import tqdm
 
+from src.trainer_utils import find_executable_batch_size
+
 
 @dataclass
 class TrainerArgs:
@@ -44,6 +43,7 @@ class TrainerArgs:
     lower_is_worse: bool = False
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
+    find_executable_batch_size: bool = False
 
 
 class TrainerArgumentParser(ArgumentParser):
@@ -63,6 +63,7 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--lower_is_worse", action="store_true")
         self.add_argument("--max_norm", type=float, default=1.0)
         self.add_argument("--gradient_accumulation_steps", type=int, default=1)
+        self.add_argument("--find_executable_batch_size", action="store_true")
 
 
 class EarlyStopper:
@@ -142,8 +143,27 @@ class Trainer(ABC):
                 raise FileExistsError(f"Output Directory Already Exists: {self.args.outdir}")
         self.args.outdir.mkdir(parents=True, exist_ok=True)
 
+        @find_executable_batch_size(
+            starting_batch_size=self.args.vl_batch_size,
+            starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+        )
+        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
+            nonlocal self
+            self.args.vl_batch_size = batch_size
+            return self.evaluate()
+
+        @find_executable_batch_size(
+            starting_batch_size=self.args.vl_batch_size,
+            starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+        )
+        def train(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
+            nonlocal self
+            self.args.tr_batch_size = batch_size
+            self.args.gradient_accumulation_steps = gradient_accumulation_steps
+            return self.train()
+
         tr_metrics = {k: float("nan") for k in self.tr_metric_keys}
-        vl_metrics = self.evaluate()
+        vl_metrics = evaluate()
         d = {"epoch": 0, "learning_rate": float("nan")} | tr_metrics | vl_metrics
         self.update_logs(d)
         self.update_best(d)
@@ -151,8 +171,8 @@ class Trainer(ABC):
 
         pbar = self._get_pbar(range(1, self.args.epochs + 1), desc="Epochs")
         for epoch in pbar:
-            tr_metrics = self.train()
-            vl_metrics = self.evaluate()
+            tr_metrics = train()
+            vl_metrics = evaluate()
             learning_rate = self.scheduler.get_last_lr()[0] if self.scheduler is not None else self.args.learning_rate
             d = {"epoch": epoch, "learning_rate": learning_rate} | tr_metrics | vl_metrics
             self.update_logs(d)
