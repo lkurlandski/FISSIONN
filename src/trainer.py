@@ -44,6 +44,7 @@ class TrainerArgs:
     lr_scheduler_patience: Optional[int] = None
     early_stopping_patience: Optional[int] = None
     max_norm: float = 1.0
+    gradient_accumulation_steps: int = 1
 
 
 class TrainerArgumentParser(ArgumentParser):
@@ -64,6 +65,7 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--lr_scheduler_patience", type=int, default=None)
         self.add_argument("--early_stopping_patience", type=int, default=None)
         self.add_argument("--max_norm", type=float, default=1.0)
+        self.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
 
 class EarlyStopper:
@@ -201,26 +203,47 @@ class Trainer(ABC):
     def train(self) -> dict[str, float]:
         t_0 = time.time()
 
-        results: defaultdict[str, list[float]] = defaultdict(list)
         self.model.train()
         dataloader = self.get_tr_dataloader()
-        pbar = self._get_pbar(dataloader, total=len(self.tr_dataset) // self.args.tr_batch_size)
-        for step, batch in enumerate(pbar):
 
+        num_steps = math.ceil(len(dataloader) / self.args.gradient_accumulation_steps)
+        results: defaultdict[str, list[float]] = defaultdict(lambda: [0] * num_steps)
+        step = 0
+
+        pbar = self._get_pbar(dataloader, total=len(dataloader))
+        for mini_step, batch in enumerate(pbar):
+
+            # Compute normalized loss
             self.model.zero_grad()
             outputs = self.forward(batch)
             loss, losses = self.compute_loss(batch, outputs)
+            loss = loss / self.args.gradient_accumulation_steps
+            losses = {k: v / self.args.gradient_accumulation_steps for k, v in losses.items()}
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm, error_if_nonfinite=True)
-            self.optimizer.step()
 
-            results["tr_loss"].append(loss.item())
+            # Add to running metrics
+            results["tr_loss"][step] += loss.item()
             for k, v in losses.items():
-                results[f"tr_{k}"].append(v)
-            if self.args.logging_steps > 0 and step % self.args.logging_steps == 0:
-                d = {"_tr_loss": mean(results["tr_loss"][-self.args.logging_steps:])}
+                results[f"tr_{k}"][step] += v
+
+            # Update weights every `gradient_accumulation_steps` `mini_steps`
+            condition_1 = (mini_step + 1) % self.args.gradient_accumulation_steps == 0
+            condition_2 = (mini_step + 1) == len(dataloader)
+            if condition_1 or condition_2:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_norm)
+                self.optimizer.step()
+                step += 1
+
+            # Perform logging every `logging_steps` `steps`
+            condition_1 = self.args.logging_steps > 0
+            condition_2 = (step + 1) % self.args.logging_steps == 0
+            if condition_1 and condition_2:
+                d = {"step": step}
+                for k, v in results.items():
+                    d[f"_{k}"] = mean(results[k][-self.args.logging_steps:])
                 print(self._fmt_dict(d))
 
+        # Average statistics over epoch
         for k, v in results.items():
             results[k] = mean(v)
         results["tr_time"] = time.time() - t_0
