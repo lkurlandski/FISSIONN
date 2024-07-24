@@ -370,16 +370,83 @@ class TransformerApproximator(nn.Module):
 
         return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
 
-    def beam_search(self, x: Tensor, max_len: int, beam_size: int) -> Tensor:
-        raise NotImplementedError("Beam Search Not Yet Implemented.")
+    def beam_search(self, x: Tensor, max_length: int, num_beams: int) -> Tensor:
+
+        raise NotImplementedError("Beam Search algorithm requires a means to score the value of beams.")
+
+        N = num_beams
+        B = x.size(0)
+        L = x.size(1)
+        D = x.device
+
+        # Initial embedding and encoding of the source sequence
+        src = self.embed(x)                                          # (B, L, H)
+        src_mask = torch.zeros((L, L), dtype=torch.bool, device=D)   # (L, L)
+        src_padding_mask = (x == PAD).to(D)                          # (B, L)
+        mem = self.encoder.forward(src, src_mask, src_padding_mask)  # (B, L, H)
+
+        # Initialize the beam search
+        y = bos((B * N, 1)).to(D)                                          # (B * N, 1)
+        scores = torch.zeros((B * N, 1), device=D)                         # (B * N, 1)
+        generated_eos = torch.zeros((B * N,), dtype=torch.bool, device=D)  # (B * N)
+
+        # Expand memory to accommodate beam size
+        mem = mem.repeat_interleave(N, dim=0)  # (B * N, L, H)
+
+        for l in range(1, max_length - 1):
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(l, D, torch.bool)  # (l, l)
+            tgt = self.embed(y)                                                          # (B * N, l, H)
+            out = self.decoder.forward(tgt, mem, tgt_mask)                               # (B * N, l, H)
+            y_pred = self.projection_out(out).squeeze(2)                                 # (B * N, l)
+
+            # Compute scores and update beam
+            # log_probs = torch.log_softmax(y_pred[:, -1], dim=-1)         # (B * N,)
+            # scores = scores + log_probs                                  # (B * N, B * N)
+            pred_next = y_pred[:, -1]                                      # (B * N,)
+            abs_error = torch.abs(pred_next.unsqueeze(1) - y_pred[:, -1])  # (B * N, 1)
+            scores = scores - abs_error                                    # (B * N, 1)
+            scores = scores + abs_error                                    # (B * N, B * N)
+
+            # Flatten scores for easy topk selection
+            # scores = scores.view(B, N * log_probs.size(-1))            # (B, B * N * N)
+            # topk_scores, topk_indices = torch.topk(scores, N, dim=-1)  # (B, N), (B, N)
+            scores = scores.view(B, N * pred_next.size(-1))              # (B, N * N)
+            topk_scores, topk_indices = torch.topk(scores, N, dim=-1)    # (B, N)
+
+            # Determine the corresponding beams and vocabulary indices
+            # beam_indices = topk_indices // log_probs.size(-1)          # (B, N)
+            # vocab_indices = topk_indices % log_probs.size(-1)          # (B, N)
+            beam_indices = topk_indices // pred_next.size(-1)            # (B, N)
+            real_values = pred_next[topk_indices % pred_next.size(-1)]   # (B, N)
+
+            # Update the beam search variables
+            y = y.view(B, N, -1)                                                           # (B, N, l)
+            y = torch.gather(y, 1, beam_indices.unsqueeze(-1).expand(-1, -1, y.size(-1)))  # (B, N, l)
+            y = y.view(B * N, -1)                                                          # (B * N, l)
+            # y = torch.cat([y, vocab_indices.view(-1, 1)], dim=-1)                        # (B * N, l + 1)
+            y = torch.cat([y, real_values.view(-1, 1)], dim=-1)                            # (B * N, l + 1)
+
+            scores = topk_scores.view(B * N, 1)                                # (B * N, 1)
+            # generated_eos = generated_eos | (vocab_indices.view(-1) == EOS)  # (B * N)
+            generated_eos = generated_eos | (real_values.view(-1) == EOS)      # (B * N)
+
+            if generated_eos.all():
+                break
+
+        # Select the best beam for each sequence
+        y = y.view(B, N, -1)                                                               # (B, N, L - 1)
+        scores = scores.view(B, N)                                                         # (B, N)
+        best_beam_indices = torch.argmax(scores, dim=-1)                                   # (B,)
+        y = torch.cat([y[i, best_beam_indices[i]].unsqueeze(0) for i in range(B)], dim=0)  # (B, L - 1)
+
+        # Add EOS to the sequences which have not generated EOS yet. Else add PAD.
+        final = eos((B,)).to(D)                            # (B,)
+        final[~generated_eos.view(B, N).any(dim=1)] = PAD  # (B,)
+        y = torch.cat([y, final.unsqueeze(1)], dim=1)      # (B, L)
+
+        return y
 
     def greedy_decode(self, x: Tensor, max_length: int) -> Tensor:
-        if self.training:
-            raise RuntimeError("Call `eval()` before using model for inference.")
-        if torch.is_grad_enabled():
-            raise RuntimeError("Disable gradient computation before using model for inference.")
-        if x.dim() != 2:
-            raise ShapeError((x.shape), ("B", "L"))
 
         B = x.size(0)
         L = x.size(1)
@@ -414,13 +481,22 @@ class TransformerApproximator(nn.Module):
 
         return y
 
-    def translate(self, x: Tensor, max_length: int, alg: Literal["greedy", "beam"]) -> Tensor:
+    def translate(
+        self,
+        x: Tensor,
+        max_length: int,
+        alg: Literal["greedy", "beam"],
+        num_beams: int = -1,
+    ) -> Tensor:
+        if x.dim() != 2:
+            raise ShapeError((x.shape), ("B", "L"))
+
         self.eval()
         with torch.no_grad():
             if alg == "greedy":
                 y = self.greedy_decode(x, max_length)
             elif alg == "beam":
-                y = self.beam_search(x, max_length)
+                y = self.beam_search(x, max_length, num_beams)
             else:
                 raise ValueError(f"Invalid Algorithm: {alg}")
         return y
