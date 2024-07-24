@@ -446,7 +446,18 @@ class TransformerApproximator(nn.Module):
 
         return y
 
-    def greedy_decode(self, x: Tensor, max_length: int) -> Tensor:
+    def greedy_decode(self, x: Tensor, max_length: int, noise_level: Optional[float] = None) -> Tensor:
+
+        _sampler = torch.distributions.Laplace(0, noise_level) if noise_level else None
+
+        def add_noise(x: Tensor) -> Tensor:
+            if not noise_level:
+                return x
+            noise = _sampler.sample(x.size()).to(D)
+            noisy_x = x + noise
+            ignore = ((x == PAD) | (x == BOS) | (x == EOS) | (noisy_x < 0))
+            noise[ignore] = 0.0
+            return x + noise
 
         B = x.size(0)
         L = x.size(1)
@@ -466,8 +477,9 @@ class TransformerApproximator(nn.Module):
             tgt = self.embed(y)
             out = self.decoder.forward(tgt, mem, tgt_mask)
 
-            y_pred = self.projection_out(out).squeeze(2)
+            y_pred = self.projection_out.forward(out).squeeze(2)
             y_next = y_pred[:, -1]
+            y_next = add_noise(y_next)
             y = torch.cat([y, y_next.unsqueeze(1)], dim=1)
 
             generated_eos = generated_eos | (y_next == EOS)
@@ -486,7 +498,9 @@ class TransformerApproximator(nn.Module):
         x: Tensor,
         max_length: int,
         alg: Literal["greedy", "beam"],
-        num_beams: int = -1,
+        *,
+        noise_level: Optional[float] = None,
+        num_beams: Optional[int] = None,
     ) -> Tensor:
         if x.dim() != 2:
             raise ShapeError((x.shape), ("B", "L"))
@@ -494,7 +508,7 @@ class TransformerApproximator(nn.Module):
         self.eval()
         with torch.no_grad():
             if alg == "greedy":
-                y = self.greedy_decode(x, max_length)
+                y = self.greedy_decode(x, max_length, noise_level)
             elif alg == "beam":
                 y = self.beam_search(x, max_length, num_beams)
             else:
