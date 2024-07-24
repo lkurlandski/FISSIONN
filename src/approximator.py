@@ -57,7 +57,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_data
-from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser
+from src.trainer import TrainerArgs, Seq2SeqTrainer, TrainerArgumentParser
 from src.utils import (
     count_parameters,
     seed_everything,
@@ -426,7 +426,7 @@ class TransformerApproximator(nn.Module):
         return y
 
 
-class ApproximatorTrainer(Trainer):
+class ApproximatorTrainer(Seq2SeqTrainer):
 
     model: RecurrentApproximator | TransformerApproximator
     tr_dataset: ApproximatorDataset
@@ -456,6 +456,24 @@ class ApproximatorTrainer(Trainer):
         y_pred: Tensor = outputs[0]
         loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
         return loss, {}
+
+    def translate(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
+        x = batch[0].to(self.args.device)
+        y = self.model.translate(x, 256, "greedy")
+        return (y,)
+
+    def compute_metrics_translate(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> dict[str, float]:
+        y_true = batch[1].to(self.args.device)
+        y_pred = outputs[0].to(self.args.device)
+
+        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS) & (y_pred != PAD) & (y_pred != BOS) & (y_pred != EOS)
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+
+        mae = nn.L1Loss().forward(y_true, y_pred)
+        mse = nn.MSELoss().forward(y_true, y_pred)
+
+        return {"loss": mse.item(), "mse": mse.item(), "mae": mae.item()}
 
 
 class OutputHelper:

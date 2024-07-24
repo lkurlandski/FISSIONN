@@ -250,14 +250,14 @@ class Trainer(ABC):
 
             # Perform logging every `logging_steps` `steps` (not minibatch steps!)
             condition_1 = self.args.logging_steps > 0
-            condition_2 = (step + 1) % self.args.logging_steps == 0
-            condition_3 = step > 0
+            condition_2 = step > 0
+            condition_3 = step % self.args.logging_steps == 0
             if condition_1 and condition_2 and condition_3:
                 d = {"step": step}
                 for k, v in results.items():
-                    start = (step - 1) * self.args.logging_steps
-                    stop = step * self.args.logging_steps
-                    d[f"_{k}"] = mean(results[k][start:stop])
+                    start = (step - self.args.logging_steps)
+                    stop = start + self.args.logging_steps
+                    d[f"_{k}"] = mean(v[start:stop])
                 print(self._fmt_dict(d))
 
         # Average statistics over epoch
@@ -354,3 +354,50 @@ class Trainer(ABC):
 
     def _fmt_dict(self, d: dict[str, float]) -> dict[str, str]:
         return {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in d.items()}
+
+
+class Seq2SeqTrainer(Trainer):
+
+    def evaluate(self) -> dict[str, float]:
+        t_0 = time.time()
+
+        results: defaultdict[str, list[float]] = defaultdict(list)
+        self.model.eval()
+        dataloader = self.get_vl_dataloader()
+        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size)
+        with torch.no_grad():
+            for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
+                outputs = self.translate(batch)
+                metrics = self.compute_metrics_translate(batch, outputs)
+                for k, v in metrics.items():
+                    results[f"vl_{k}"].append(v)
+
+        for k, v in results.items():
+            results[k] = mean(v)
+        results["vl_time"] = time.time() - t_0
+
+        return dict(results)
+
+    @abstractmethod
+    def translate(self, batch: tuple) -> tuple:
+        """Translate a batch of inputs through the model.
+
+        Args:
+            batch (tuple): batch of inputs.
+
+        Returns:
+            tuple: model output(s), e.g., a predicted sequence.
+        """
+
+    def compute_metrics_translate(self, batch: tuple, outputs: tuple) -> dict[str, float]:
+        """Compute the validation metrics over a batch of examples.
+
+        Args:
+            batch (tuple): batch of inputs.
+            outputs (tuple): model output(s), e.g., logits, as return by self.forward.
+            loss (Tensor): model loss over the batch.
+
+        Returns:
+            dict[str, float]: metrics for the batch.
+        """
+        return {}
