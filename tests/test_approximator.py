@@ -24,10 +24,15 @@ class TestTranslate(unittest.TestCase):
         b = bos((self.batch_size, 1))
         e = eos((self.batch_size, 1))
         self.x = torch.cat([b, x, e], dim=1)
+        self.model = TransformerApproximator(self.max_length, **TransformerApproximator.SMALL)
 
     def test_greedy(self):
-        model = TransformerApproximator(self.max_length, **TransformerApproximator.SMALL)
-        y = model.translate(self.x, self.max_length, "greedy")
+        y = self.model.translate(self.x, self.max_length, "greedy")
+        print(y)
+
+    unittest.skip("Skipping beam test")
+    def test_beam(self):
+        y = self.model.translate(self.x, self.max_length, "beam", num_beams=4)
         print(y)
 
 
