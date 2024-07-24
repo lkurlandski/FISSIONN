@@ -248,13 +248,16 @@ class Trainer(ABC):
                 self.optimizer.zero_grad()
                 step += 1
 
-            # Perform logging every `logging_steps` `steps`
+            # Perform logging every `logging_steps` `steps` (not minibatch steps!)
             condition_1 = self.args.logging_steps > 0
             condition_2 = (step + 1) % self.args.logging_steps == 0
-            if condition_1 and condition_2:
+            condition_3 = step > 0
+            if condition_1 and condition_2 and condition_3:
                 d = {"step": step}
                 for k, v in results.items():
-                    d[f"_{k}"] = mean(results[k][-self.args.logging_steps:])
+                    start = (step - 1) * self.args.logging_steps
+                    stop = step * self.args.logging_steps
+                    d[f"_{k}"] = mean(results[k][start:stop])
                 print(self._fmt_dict(d))
 
         # Average statistics over epoch
