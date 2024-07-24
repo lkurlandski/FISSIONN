@@ -41,6 +41,8 @@ from statistics import mean
 import sys
 from typing import Callable, Generator, Literal, Optional, Self
 
+import numpy as np
+from scipy import stats
 from sklearn.model_selection import train_test_split
 import torch
 from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
@@ -120,6 +122,32 @@ class ApproximatorDataset(Dataset):
         """A pair consists of a IPD sequence and the IPD sequence following a chain of hops."""
         for group in ipd_groups:
             yield group[0], group[-1]
+
+    @staticmethod
+    def get_synthetic_sample() -> np.ndarray:
+        loc = abs(stats.laplace.rvs(loc=0, scale=2.19e-2))
+        scale = abs(stats.laplace.rvs(loc=0, scale=1.03e-1))
+        length = abs(stats.laplace.rvs(loc=0, scale=575))
+        ipds = stats.laplace.rvs(loc=loc, scale=scale, size=int(length))
+        return ipds
+
+    @staticmethod
+    def get_synthetic_hop(ipds: np.ndarray) -> np.ndarray:
+        org_loc, org_scale = stats.laplace.fit(ipds)
+
+        delta_scale = stats.laplace.rvs(loc=8.09e-3, scale=2.61e-2)
+        new_scale = org_scale + delta_scale
+        if new_scale < 0:
+            raise ValueError(f"Invalid {new_scale=}")
+
+        delta_length = stats.laplace.rvs(loc=-2.00, scale=298)
+        new_length = len(ipds) + delta_length
+        if new_length < 0:
+            raise ValueError(f"Invalid {new_length=}")
+
+        ipds = stats.laplace.rvs(loc=org_loc, scale=new_scale, size=int(new_length))
+        ipds = np.absolute(ipds)
+        return ipds
 
 
 BUILDER_PAIR_MODES: dict[str, Callable[[list[list[list[float]]]], Generator[tuple[list[float], list[float]]]]] = {
