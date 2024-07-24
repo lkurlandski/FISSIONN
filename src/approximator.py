@@ -556,14 +556,18 @@ class ApproximatorTrainer(Seq2SeqTrainer):
         y_true = batch[1].to(self.args.device)
         y_pred = outputs[0].to(self.args.device)
 
-        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS) & (y_pred != PAD) & (y_pred != BOS) & (y_pred != EOS)
+        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
         y_true = y_true[mask]
         y_pred = y_pred[mask]
 
-        mae = nn.L1Loss().forward(y_true, y_pred)
-        mse = nn.MSELoss().forward(y_true, y_pred)
+        mae = nn.L1Loss().forward(y_true, y_pred).item()
+        mse = nn.MSELoss().forward(y_true, y_pred).item()
 
-        return {"loss": mse.item(), "mse": mse.item(), "mae": mae.item()}
+        return {"mse": mse, "mae": mae}
+
+    def get_gn_dataloader(self) -> DataLoader:
+        gn_dataset = Subset(self.vl_dataset, list(range(len(self.vl_dataset) // 4)))
+        return self.get_dataloader(gn_dataset, self.args.vl_batch_size, False)
 
 
 class OutputHelper:

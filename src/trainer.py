@@ -22,7 +22,7 @@ from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer, AdamW
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import Dataset, DataLoader, IterableDataset, Subset
 from tqdm import tqdm
 
 from src.trainer_utils import find_executable_batch_size
@@ -210,7 +210,8 @@ class Trainer(ABC):
         for checkpoint in checkpoints:
             e = int(checkpoint.stem.split("_")[1])
             if e not in (self.best_epoch, results["epoch"]):
-                checkpoint.unlink()
+                ...
+                # checkpoint.unlink()
 
     def train(self) -> dict[str, float]:
         t_0 = time.time()
@@ -359,26 +360,26 @@ class Trainer(ABC):
 class Seq2SeqTrainer(Trainer):
 
     def evaluate(self) -> dict[str, float]:
-        t_0 = time.time()
 
+        basal_results = super().evaluate()
+
+        t_0 = time.time()
         results: defaultdict[str, list[float]] = defaultdict(list)
         self.model.eval()
-        dataloader = self.get_vl_dataloader()
+        dataloader = self.get_gn_dataloader()
         pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size)
         with torch.no_grad():
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
                 outputs = self.translate(batch)
-                # if step == 0:
-                #     print([round(i, 4) for i in outputs[0][0].tolist()])
                 metrics = self.compute_metrics_translate(batch, outputs)
                 for k, v in metrics.items():
-                    results[f"vl_{k}"].append(v)
+                    results[f"gn_{k}"].append(v)
 
         for k, v in results.items():
             results[k] = mean(v)
-        results["vl_time"] = time.time() - t_0
+        results["gn_time"] = time.time() - t_0
 
-        return dict(results)
+        return basal_results | dict(results)
 
     @abstractmethod
     def translate(self, batch: tuple) -> tuple:
@@ -403,3 +404,6 @@ class Seq2SeqTrainer(Trainer):
             dict[str, float]: metrics for the batch.
         """
         return {}
+
+    def get_gn_dataloader(self) -> DataLoader:
+        return self.get_vl_dataloader()
