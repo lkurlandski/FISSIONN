@@ -129,6 +129,7 @@ class ApproximatorDataset(Dataset):
         scale = abs(stats.laplace.rvs(loc=0, scale=1.03e-1))
         length = abs(stats.laplace.rvs(loc=0, scale=575))
         ipds = stats.laplace.rvs(loc=loc, scale=scale, size=int(length))
+        ipds = np.absolute(ipds)
         return ipds
 
     @staticmethod
