@@ -549,7 +549,7 @@ class ApproximatorTrainer(Seq2SeqTrainer):
 
     def translate(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
         x = batch[0].to(self.args.device)
-        y = self.model.translate(x, 256, "greedy")
+        y = self.model.translate(x, 256, "greedy", noise_level=1.03e-2)
         return (y,)
 
     def compute_metrics_translate(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> dict[str, float]:

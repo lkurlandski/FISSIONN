@@ -368,6 +368,8 @@ class Seq2SeqTrainer(Trainer):
         with torch.no_grad():
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
                 outputs = self.translate(batch)
+                # if step == 0:
+                #     print([round(i, 4) for i in outputs[0][0].tolist()])
                 metrics = self.compute_metrics_translate(batch, outputs)
                 for k, v in metrics.items():
                     results[f"vl_{k}"].append(v)
