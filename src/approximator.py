@@ -1,6 +1,15 @@
 """
 A network to approximate the noising process of IPDs through SSI chains.
 
+
+Sources
+-------
+- "NLP From Scratch: Translation with a Sequence to Sequence Network and Attention"
+  (https://github.com/pytorch/tutorials/blob/main/intermediate_source/seq2seq_translation_tutorial.py)
+- "Language Translation with nn.Transformer and torchtext"
+  (https://pytorch.org/tutorials/beginner/translation_transformer.html)
+
+
 Overflow Issue
 --------------
 
@@ -27,7 +36,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 with sdpa_kernel(SDPBackend.MATH):
     ...
 ```
-
 """
 
 from __future__ import annotations
