@@ -46,6 +46,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 from pprint import pformat
+import random
 from statistics import mean
 import sys
 from typing import Callable, Generator, Literal, Optional, Self
@@ -56,6 +57,7 @@ from scipy import stats
 from sklearn.model_selection import train_test_split
 import torch
 from torch import nn, Tensor, BoolTensor
+from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
@@ -234,13 +236,31 @@ class ApproximatorLossFn(nn.Module):
         return self.loss_fn.forward(y_pred[mask], y_true[mask])
 
 
-class ApproximatorDecoder:
+class Attention(nn.Module):
 
-    def __init__(self) -> None:
-        ...
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.Wa = nn.Linear(hidden_size, hidden_size)
+        self.Ua = nn.Linear(hidden_size, hidden_size)
+        self.Va = nn.Linear(hidden_size, 1)
+
+    def forward(self, query: Tensor, keys: Tensor) -> tuple[Tensor, Tensor]:
+        w = self.Wa.forward(query)
+        u = self.Ua.forward(keys)
+        v = self.Va.forward(F.tanh(w + u))
+        scores = v.squeeze(2).unsqueeze(1)
+        weights = F.softmax(scores, dim=-1)
+        context = torch.bmm(weights, keys)
+        return context, weights
 
 
 class RecurrentApproximator(nn.Module):
+
+    # B - batch size
+    # T - sequence length
+    # I - input size
+    # H - hidden size
+    # L - num layers
 
     PUNY = {"hidden_size": 64, "num_layers": 1}
     TINY = {"hidden_size": 128, "num_layers": 2}
@@ -248,42 +268,119 @@ class RecurrentApproximator(nn.Module):
     MEDIUM = {"hidden_size": 384, "num_layers": 6}
     LARGE = {"hidden_size": 512, "num_layers": 8}
     HUGE = {"hidden_size": 768, "num_layers": 12}
+    CELL = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}
 
     def __init__(
         self,
+        max_length: int,
         hidden_size: int,
         num_layers: int,
-        input_size: Optional[int] = None,
-        bidirectional: bool = False,
-        cell: nn.RNN | nn.LSTM | nn.GRU | Literal["rnn", "lstm", "gru"] = nn.RNN,
+        cell: Literal["rnn", "lstm", "gru"] = "rnn",
+        **kwds,
     ) -> None:
+        if kwds.get("bidirectional", False):
+            raise NotImplementedError("Bidirectional RNNs are not supported.")
+
         super().__init__()
-        input_size = input_size if input_size is not None else hidden_size
-        self.projection_in = nn.Linear(1, input_size)
-        if isinstance(cell, str):
-            cell = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[cell.lower()]
+        self.max_length = max_length
+        cell = RecurrentApproximator.CELL[cell]
+        self.embedding = nn.Linear(1, hidden_size)
+        self.dropout = nn.Dropout(0.1)
+        self.attention = Attention(hidden_size)
         self.encoder: nn.RNN | nn.LSTM | nn.GRU = cell(
-            input_size, hidden_size, num_layers,
-            batch_first=True, bidirectional=bidirectional,
+            hidden_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            **kwds,
         )
-        self.projection_mid = nn.Linear(2 * hidden_size if bidirectional else hidden_size, hidden_size)
         self.decoder: nn.RNN | nn.LSTM | nn.GRU = cell(
-            hidden_size, hidden_size, num_layers,
-            batch_first=True, bidirectional=bidirectional,
+            2 * hidden_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            **kwds,
         )
-        self.projection_out = nn.Linear(2 * hidden_size if bidirectional else hidden_size, 1)
+        self.head = nn.Linear(hidden_size, 1)
 
-    def forward(self, x: Tensor, _: Tensor) -> Tensor:
-        if x.dim() != 2:
-            raise ShapeError((x.shape), ("B", "L"))
+    def embed(self, inputs: Tensor) -> Tensor:
+        if inputs.dim() != 2:
+            raise ShapeError((inputs.shape), ("B", "L"))
+        x = inputs.unsqueeze(2)
+        x = self.embedding.forward(x)
+        x = self.dropout.forward(x)
+        return x
 
+    def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor]:
+        x = self.encoder.forward(embeddings)
+        return x
+
+    def decode(
+        self,
+        encoder_outputs: Tensor,
+        encoder_hidden: Tensor,
+        targets: Optional[Tensor] = None,
+        ratio: float = 1.0,
+    ) -> Tensor:
+        decoder_hidden = encoder_hidden                                               # (L, B, H)
+        decoder_input = bos((encoder_outputs.size(0), 1)).to(encoder_outputs.device)  # (B, 1)
+    
+        decoder_outputs, attentions = [], []
+        for i in range(self.max_length):
+            decoder_output, decoder_hidden, attn_weights = self.decode_step(
+                decoder_input,
+                decoder_hidden,
+                encoder_outputs,
+            )
+    
+            decoder_outputs.append(decoder_output)
+            attentions.append(attn_weights)
+    
+            if targets is not None and random.random() < ratio:
+                decoder_input = targets[:, i].unsqueeze(1)
+            else:
+                _, topi = decoder_output.topk(1)
+                decoder_input = topi.squeeze(-1).detach()
+
+        decoder_outputs = torch.cat(decoder_outputs, dim=1)
+        decoder_outputs = F.log_softmax(decoder_outputs, dim=-1)
+        attentions = torch.cat(attentions, dim=1)
+
+        return decoder_outputs, decoder_hidden, attentions
+
+    def decode_step(
+        self,
+        inputs: Tensor,
+        hidden: Tensor,
+        encoder_outputs: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        embeddings = self.embed(inputs)          # (B, 1, H)
+        query = hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
+
+        context, attn_weights = self.attention.forward(query, encoder_outputs)  # (B, 1, H), (B, 1, 2 * H)
+        decoder_inputs = torch.cat((embeddings, context), dim=2)                # (B, 1, 2 * H)
+        output, hidden = self.decoder.forward(decoder_inputs, hidden)           # (B, 1, H), (L, B, H)
+
+        return output, hidden, attn_weights
+
+    def project(self, output: Tensor) -> Tensor:
+        if output.dim() != 3:
+            raise ShapeError((x.shape), ("B", "L", "H"))
+        x = self.head.forward(output)
         x = x.unsqueeze(2)
-        src = self.projection_in.forward(x)
-        mem = self.encoder.forward(src)[0]
-        mem = self.projection_mid.forward(mem)
-        out = self.decoder.forward(mem)[0]
-        y_pred = self.projection_out.forward(out).squeeze(2)
-        return y_pred
+        return x
+
+    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, ratio: float = 1.0) -> Tensor:
+
+        embeddings = self.embed(inputs)                            # (B, L, H)
+        encoder_outputs, encoder_hidden = self.encode(embeddings)  # (B, L, H), (L, B, H)
+        decoder_outputs, decoder_hidden, attentions = self.decode(
+            encoder_outputs,
+            encoder_hidden,
+            targets,
+            ratio,
+        )
+        
 
 
 class PositionalEncoding(nn.Module):
@@ -668,7 +765,7 @@ def main() -> None:
         if args.arch_config in ("tiny", "small"):
             BACKEND = SDPBackend.MATH
     else:
-        config = getattr(RecurrentApproximator, args.arch_config.upper())
+        config = {"max_length": args.max_length} | getattr(RecurrentApproximator, args.arch_config.upper())
         model = RecurrentApproximator(**config)
 
     print(f"Model:\n{model}")
@@ -701,7 +798,7 @@ def main() -> None:
         loss_fn,
     )
 
-    trainer.evaluate_saved_models()
+    trainer()
 
 
 if __name__ == "__main__":
