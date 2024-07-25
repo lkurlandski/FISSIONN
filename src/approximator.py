@@ -471,7 +471,7 @@ class TransformerApproximator(nn.Module):
 
     def greedy_decode(self, x: Tensor, max_length: int, noise_level: Optional[float] = None) -> Tensor:
 
-        _sampler = torch.distributions.Laplace(0, noise_level) if noise_level else None
+        _sampler = torch.distributions.Normal(0, noise_level) if noise_level else None
 
         def add_noise(x: Tensor) -> Tensor:
             if not noise_level:
@@ -579,12 +579,12 @@ class ApproximatorTrainer(Seq2SeqTrainer):
         y_true = batch[1].to(self.args.device)
         y_pred = outputs[0].to(self.args.device)
 
-        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
+        mask: Tensor = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
         y_true = y_true[mask]
         y_pred = y_pred[mask]
 
-        mae = nn.L1Loss().forward(y_true, y_pred).item()
-        mse = nn.MSELoss().forward(y_true, y_pred).item()
+        mae = nn.L1Loss().forward(y_pred, y_true).item()
+        mse = nn.MSELoss().forward(y_pred, y_true).item()
 
         return {"mse": mse, "mae": mae}
 
@@ -693,7 +693,7 @@ def main() -> None:
         loss_fn,
     )
 
-    trainer()
+    trainer.evaluate_saved_models()
 
 
 if __name__ == "__main__":

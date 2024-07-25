@@ -190,6 +190,35 @@ class Trainer(ABC):
             if any(math.isnan(d[m]) or math.isinf(d[m]) for m in ("tr_loss", "vl_loss")):
                 raise ValueError(f"NaN/Inf Loss Detected!")
 
+    def evaluate_saved_models(self) -> None:
+
+        @find_executable_batch_size(
+            starting_batch_size=self.args.vl_batch_size,
+            starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+        )
+        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
+            nonlocal self
+            self.args.vl_batch_size = batch_size
+            return self.evaluate()
+
+        if not self.args.find_executable_batch_size:
+            evaluate = self.evaluate
+
+        outfile = self.args.outdir / "results_evaluation.jsonl"
+        outfile.unlink(missing_ok=True)
+
+        pbar = self._get_pbar(range(self.args.epochs), desc="Epochs", total=self.args.epochs)
+        for epoch in pbar:
+            checkpoint = self.args.outdir / f"model_{epoch}.pth"
+            self.model = torch.load(checkpoint, map_location="cpu")
+            self.model.to(self.args.device)
+            vl_metrics = evaluate()
+            results = {"epoch": epoch} | vl_metrics
+            self.log.append(results)
+            print(self._fmt_dict(results))
+            with open(outfile, "a") as fp:
+                fp.write(json.dumps(results) + "\n")
+
     def update_logs(self, results: dict[str, float]) -> None:
         self.log.append(results)
         print(self._fmt_dict(results))
@@ -371,6 +400,8 @@ class Seq2SeqTrainer(Trainer):
         with torch.no_grad():
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
                 outputs = self.translate(batch)
+                # if step == 0:
+                #     print([f"{i:.2e}" for i in outputs[0][0].tolist()])
                 metrics = self.compute_metrics_translate(batch, outputs)
                 for k, v in metrics.items():
                     results[f"gn_{k}"].append(v)
