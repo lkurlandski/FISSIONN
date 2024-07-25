@@ -157,13 +157,13 @@ class ApproximatorDataset(Dataset):
         org_length = len(ipds)
         for _ in range(num_tries):
             delta_length = stats.laplace.rvs(loc=-2.00, scale=298)
-            new_length = org_length + delta_length
+            new_length = math.ceil(org_length + delta_length)
             if new_length > 0:
                 break
         else:
             new_length = org_length
 
-        ipds = stats.laplace.rvs(loc=0.0, scale=new_scale, size=int(new_length))
+        ipds = stats.laplace.rvs(loc=0.0, scale=new_scale, size=new_length)
         ipds = np.absolute(ipds)
         return ipds
 
