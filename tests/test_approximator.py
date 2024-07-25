@@ -1,14 +1,29 @@
 """
 """
 
-from src.approximator import TransformerApproximator
-
+from pprint import pformat
 import unittest
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from src.approximator import *
+
+
+class TestDataset(unittest.TestCase):
+
+    def ipds_to_str(self, ipds: np.ndarray) -> str:
+        return pformat([f"{ipd:.2e}" for ipd in ipds])
+
+    def test_get_synthetic_sample(self):
+        for _ in range(100):
+            ipds = ApproximatorDataset.get_synthetic_sample()
+
+    def test_get_synthetic_hop(self):
+        runs = 100
+        for _ in range(runs):
+            ipds_a = ApproximatorDataset.get_synthetic_sample()
+            ipds_b = ApproximatorDataset.get_synthetic_hop(ipds_a)
 
 
 class TestTranslate(unittest.TestCase):
