@@ -34,6 +34,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from itertools import chain, combinations
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 from pprint import pformat
@@ -46,10 +47,10 @@ import numpy as np
 from scipy import stats
 from sklearn.model_selection import train_test_split
 import torch
-from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
 from torch import nn, Tensor, BoolTensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
+from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
@@ -134,6 +135,12 @@ class ApproximatorDataset(Dataset):
         return ipds
 
     @staticmethod
+    def get_synthetic_samples(n_samples: int, n_processes: Optional[int] = None) -> list[np.ndarray]:
+        n_processes = len(os.sched_getaffinity()) // 2 if n_processes is None else n_processes
+        with mp.Pool(n_processes) as pool:
+            return pool.map(ApproximatorDataset.get_synthetic_sample, range(n_samples))
+
+    @staticmethod
     def get_synthetic_hop(ipds: np.ndarray, num_tries: int = 1) -> np.ndarray:
         if num_tries < 1:
             raise ValueError(f"{num_tries=}")
@@ -159,6 +166,12 @@ class ApproximatorDataset(Dataset):
         ipds = stats.laplace.rvs(loc=0.0, scale=new_scale, size=int(new_length))
         ipds = np.absolute(ipds)
         return ipds
+
+    @staticmethod
+    def get_synthetic_hops(ipds: list[np.ndarray], num_tries: int = 1, n_processes: Optional[int] = None) -> list[np.ndarray]:
+        n_processes = len(os.sched_getaffinity()) // 2 if n_processes is None else n_processes
+        with mp.Pool(n_processes) as pool:
+            return pool.starmap(ApproximatorDataset.get_synthetic_hop, zip(ipds, [num_tries] * len(ipds)))
 
 
 BUILDER_PAIR_MODES: dict[str, Callable[[list[list[list[float]]]], Generator[tuple[list[float], list[float]]]]] = {
