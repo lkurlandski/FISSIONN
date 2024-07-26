@@ -279,7 +279,7 @@ class Trainer(ABC):
         results: defaultdict[str, list[float]] = defaultdict(lambda: [0] * num_steps)
         step = 0
 
-        pbar = self._get_pbar(dataloader, total=len(dataloader))
+        pbar = self._get_pbar(dataloader, total=len(dataloader), desc="Training...")
         for mini_step, batch in enumerate(pbar):
 
             # Compute normalized loss, skip noisy losses
@@ -331,11 +331,11 @@ class Trainer(ABC):
         results: defaultdict[str, list[float]] = defaultdict(list)
         self.model.eval()
         dataloader = self.get_vl_dataloader()
-        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size)
+        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size, desc="Validating...")
         with torch.no_grad():
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
 
-                outputs = self.forward(batch)
+                outputs = self.forward_eval(batch)
                 loss, losses = self.compute_loss(batch, outputs)
                 metrics = self.compute_metrics(batch, outputs)
 
@@ -361,6 +361,9 @@ class Trainer(ABC):
         Returns:
             tuple: model output(s), e.g., logits.
         """
+
+    def forward_eval(self, batch: tuple) -> tuple:
+        return self.forward(batch)
 
     @abstractmethod
     def compute_loss(self, batch: tuple, outputs: tuple) -> tuple[Tensor, dict[str, float]]:

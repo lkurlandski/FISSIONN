@@ -84,27 +84,27 @@ class TestApproximators(unittest.TestCase):
         assert predictions.size(1) in (self.max_length - 1, self.target_length), f"Got {tuple(predictions.shape)}. Expected ({self.batch_size}, {self.max_length - 1}) or ({self.batch_size}, {self.target_length})."
 
     def test_decode_rec_1(self):
-        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, ratio=1.0)[0]
+        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, 1.0)[0]
         self._test_decode(predictions)
 
     def test_decode_trn_1(self):
-        predictions = self.trn.decode(self.encoder_outputs, self.targets, ratio=1.0)
+        predictions = self.trn.decode(self.encoder_outputs, self.targets, 1.0)
         self._test_decode(predictions)
 
     def test_decode_rec_2(self):
-        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, None, ratio=0.0)[0]
+        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, None, 0.0)[0]
         self._test_decode(predictions)
 
     def test_decode_trn_2(self):
-        predictions = self.trn.decode(self.encoder_outputs, None, ratio=0.0)
+        predictions = self.trn.decode(self.encoder_outputs, None, 0.0)
         self._test_decode(predictions)
 
     def test_decode_rec_3(self):
-        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, ratio=0.5)[0]
+        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, 0.5)[0]
         self._test_decode(predictions)
 
     def test_decode_trn_3(self):
-        predictions = self.trn.decode(self.encoder_outputs, self.targets, ratio=0.5)
+        predictions = self.trn.decode(self.encoder_outputs, self.targets, 0.5)
         self._test_decode(predictions)
 
     def _test_project(self, predictions: Tensor):

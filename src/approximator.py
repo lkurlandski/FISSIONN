@@ -316,7 +316,8 @@ class RecurrentApproximator(nn.Module):
         encoder_outputs: Tensor,
         encoder_hidden: Tensor,
         targets: Optional[Tensor] = None,
-        ratio: float = 1.0,
+        teacher_force_ratio: float = 1.0,
+        teacher_force_batch_mode: bool = True,
     ) -> Tensor:
         if encoder_outputs.dim() != 3:
             raise ShapeError((encoder_outputs.shape), ("B", "L", "H"))
@@ -324,6 +325,14 @@ class RecurrentApproximator(nn.Module):
             raise ShapeError((encoder_hidden.shape), ("L", "B", "H"))
         if targets is not None and targets.dim() != 2:
             raise ShapeError((targets.shape), ("B", "T - 1"))
+
+        if targets is not None:
+            if teacher_force_batch_mode:
+                use_teacher_forcing = random.random() < teacher_force_ratio
+            else:
+                use_teacher_forcing = None
+        else:
+            use_teacher_forcing = False
 
         B = encoder_outputs.size(0)
         T_src = encoder_outputs.size(1)
@@ -352,7 +361,9 @@ class RecurrentApproximator(nn.Module):
             if (finished := finished | (prediction == PAD)).all():
                 break
 
-            use_teacher_forcing = targets is not None and random.random() < ratio
+            if not teacher_force_batch_mode:
+                use_teacher_forcing = targets is not None and random.random() < teacher_force_ratio
+
             if use_teacher_forcing:
                 if i < T_tgt:
                     decoder_input = targets[:, i].unsqueeze(1)
@@ -370,11 +381,26 @@ class RecurrentApproximator(nn.Module):
         x = x.squeeze(2)
         return x
 
-    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, ratio: float = 1.0) -> Tensor:
-        embeddings = self.embed(inputs)                                                # (B, L, H)
-        encoder_outputs, encoder_hidden = self.encode(embeddings)                      # (B, L, H), (L, B, H)
-        predictions = self.decode(encoder_outputs, encoder_hidden, targets, ratio)[0]  # (B, T)
+    def forward(
+        self,
+        inputs: Tensor,
+        targets: Optional[Tensor] = None,
+        teacher_force_ratio: float = 1.0,
+        teacher_force_batch_mode: bool = True,
+    ) -> Tensor:
+        embeddings = self.embed(inputs)                            # (B, T, H)
+        encoder_outputs, encoder_hidden = self.encode(embeddings)  # (B, T, H), (L, B, H)
+        predictions = self.decode(
+            encoder_outputs,
+            encoder_hidden,
+            targets,
+            teacher_force_ratio,
+            teacher_force_batch_mode,
+        )[0]
         return predictions
+
+    def translate(self, inputs: Tensor) -> Tensor:
+        return self.forward(inputs, None, 0.0)
 
 
 class PositionalEncoding(nn.Module):
@@ -457,7 +483,8 @@ class TransformerApproximator(nn.Module):
         self,
         encoder_outputs: Tensor,
         targets: Optional[Tensor] = None,
-        ratio: float = 1.0,
+        teacher_force_ratio: float = 1.0,
+        teacher_force_batch_mode: bool = True,
     ) -> Tensor:
 
         if encoder_outputs.dim() != 3:
@@ -471,7 +498,15 @@ class TransformerApproximator(nn.Module):
         T_max = self.max_length
         D = encoder_outputs.device
 
-        if targets is not None and ratio == 1.0:
+        if targets is not None:
+            if teacher_force_batch_mode:
+                use_teacher_forcing = random.random() < teacher_force_ratio
+            else:
+                use_teacher_forcing = None
+        else:
+            use_teacher_forcing = False
+
+        if use_teacher_forcing:
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(T_tgt, device=D, dtype=bool)
             tgt_padding_mask = (targets == PAD).to(D)  # (B, T)
             decoder_embeddings = self.embed(targets)   # (B, T, H)
@@ -495,7 +530,9 @@ class TransformerApproximator(nn.Module):
             if (finished := finished | (prediction == PAD)).all():
                 break
 
-            use_teacher_forcing = targets is not None and random.random() < ratio
+            if not teacher_force_batch_mode:
+                use_teacher_forcing = targets is not None and random.random() < teacher_force_ratio
+
             if use_teacher_forcing:
                 decoder_input = targets[:, :i + 1]
             else:
@@ -510,7 +547,13 @@ class TransformerApproximator(nn.Module):
         x = x.squeeze(2)
         return x
 
-    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, ratio: float = 1.0) -> Tensor:
+    def forward(
+        self,
+        inputs: Tensor,
+        targets: Optional[Tensor] = None,
+        teacher_force_ratio: float = 1.0,
+        teacher_force_batch_mode: bool = True,
+    ) -> Tensor:
 
         src_mask = torch.zeros(
             (inputs.size(1), inputs.size(1)), dtype=torch.bool, device=inputs.device
@@ -519,8 +562,11 @@ class TransformerApproximator(nn.Module):
 
         embeddings = self.embed(inputs)
         encoder_outputs = self.encode(embeddings, src_mask, src_padding_mask)
-        predictions = self.decode(encoder_outputs, targets, ratio)
+        predictions = self.decode(encoder_outputs, targets, teacher_force_ratio, teacher_force_batch_mode)
         return predictions
+
+    def translate(self, inputs: Tensor) -> Tensor:
+        return self.forward(inputs, None, 0.0)
 
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> TransformerApproximator:
@@ -551,7 +597,13 @@ class ApproximatorTrainer(Trainer):
     def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred = self.model.forward(x, y[:, :-1], ratio=self.teacher_ratio_scheduler.ratio)
+        y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
+        return (y_pred,)
+
+    def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
+        x: Tensor = batch[0].to(self.args.device)
+        y: Tensor = batch[1].to(self.args.device)
+        y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
         return (y_pred,)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
