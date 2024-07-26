@@ -697,15 +697,15 @@ def main() -> None:
     print(f"Collected {sum(len(group) for group in ipd_groups)} IPDs from {len(ipd_groups)} groups.")
     print("-" * 80)
 
-    tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.15)
+    tr_ipd_groups, vl_ipd_groups = train_test_split(ipd_groups, test_size=0.10)
     build_pairs_fn = BUILDER_PAIR_MODES[args.pair_mode]
     tr_dataset = ApproximatorDataset(build_pairs_fn(tr_ipd_groups))
     tr_dataset = Subset(tr_dataset, range(min(args.tr_num_samples, len(tr_dataset))))
     vl_dataset = ApproximatorDataset(build_pairs_fn(vl_ipd_groups))
     vl_dataset = Subset(vl_dataset, range(min(args.vl_num_samples, len(vl_dataset))))
 
-    print(f"Training Dataset: {tr_dataset}")
-    print(f"Validation Dataset: {vl_dataset}")
+    print(f"Training Dataset: {tr_dataset}. Length: {len(tr_dataset)}")
+    print(f"Validation Dataset: {vl_dataset}. Length: {len(vl_dataset)}")
     print("-" * 80)
 
     if args.arch == "transformer":
