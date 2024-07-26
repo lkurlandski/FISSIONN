@@ -74,7 +74,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_data
-from src.trainer import TrainerArgs, Seq2SeqTrainer, TrainerArgumentParser
+from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser, TeacherRatioScheduler, EarlyStopper
 from src.utils import (
     count_parameters,
     seed_everything,
@@ -166,7 +166,7 @@ class ApproximatorDataset(Dataset):
             if new_scale > 0:
                 break
         else:
-            new_scale = org_scale            
+            new_scale = org_scale
 
         org_length = len(ipds)
         for _ in range(num_tries):
@@ -205,8 +205,8 @@ class ApproximatorCollateFn:
         x = []
         y = []
         for x_, y_ in batch:
-            x_ = x_[0 : self.max_length - 2]
-            y_ = y_[0 : self.max_length - 2]
+            x_ = x_[0 : self.max_length - 1]
+            y_ = y_[0 : self.max_length - 1]
             x.append(torch.cat([b, x_]))
             y.append(torch.cat([b, y_]))
         x = pad_sequence(x, batch_first=True, padding_value=PAD)
@@ -217,14 +217,7 @@ class ApproximatorCollateFn:
 class ApproximatorLossFn(nn.Module):
     """
     TODO:
-     - Figure out a better way to handle mismatching special tokens. The problem
-     is that the loss between the real value and a special token is going to be
-     disproportionately high. At the moment, we simply ignore the loss between
-     values that correspond to the positions of special tokens in the target,
-     but this is not ideal, because it does not consider special tokens that may
-     appear in the input. We can't simply ignore positions where special tokens
-     appear in the input AND the target because then the model could learn to
-     predict excess special tokens since their loss is completely ignored.
+     - Figure out a better way to handle mismatching special tokens.
      - Figure out a better way to handle mismatching sequence lengths.
     """
 
@@ -233,9 +226,7 @@ class ApproximatorLossFn(nn.Module):
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
-        # y_pred_specials = (y_true == PAD) | (y_true == BOS) | (y_true == EOS)
-        # y_true_specials = (y_true == PAD) | (y_true == BOS) | (y_true == EOS)
-        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
+        mask = (y_true != PAD) & (y_true != BOS)
         return self.loss_fn.forward(y_pred[mask], y_true[mask])
 
 
@@ -334,11 +325,6 @@ class RecurrentApproximator(nn.Module):
         if targets is not None and targets.dim() != 2:
             raise ShapeError((targets.shape), ("B", "T - 1"))
 
-        # `targets` should be right-shifted by one position, e.g., targets[:, :-1].
-        # Therefore, `targets[i - 1]` is the ground truth for `predictions[i]`.
-        if targets is not None and (targets[:, 0] == BOS).any().item():
-            raise ValueError("`targets` should be right-shifted, and therefore not begin with BOS!")
-
         B = encoder_outputs.size(0)
         T_src = encoder_outputs.size(1)
         T_tgt = targets.size(1) if targets is not None else None
@@ -350,7 +336,7 @@ class RecurrentApproximator(nn.Module):
         decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
 
         finished = torch.zeros((B,), dtype=torch.bool, device=D)
-        for i in range(self.max_length - 1):
+        for i in range(1, self.max_length - 1):
 
             embeddings = self.embed(decoder_input)                        # (B, 1, H)
             final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
@@ -361,7 +347,7 @@ class RecurrentApproximator(nn.Module):
 
             prediction = self.project(decoder_output)  # (B, T)
             prediction = prediction[:, -1]             # (B,)
-            predictions[:,i + 1] = prediction          # (B, T)
+            predictions[:,i] = prediction              # (B, T)
 
             if (finished := finished | (prediction == PAD)).all():
                 break
@@ -375,7 +361,7 @@ class RecurrentApproximator(nn.Module):
             else:
                 decoder_input = prediction.unsqueeze(1)
 
-        return predictions, decoder_hidden
+        return predictions[:, 1:], decoder_hidden
 
     def project(self, output: Tensor) -> Tensor:
         if output.dim() != 3:
@@ -479,11 +465,6 @@ class TransformerApproximator(nn.Module):
         if targets is not None and targets.dim() != 2:
             raise ShapeError((targets.shape), ("B", "T - 1"))
 
-        # `targets` should be right-shifted by one position, e.g., targets[:, :-1].
-        # Therefore, `targets[i - 1]` is the ground truth for `predictions[i]`.
-        if targets is not None and (targets[:, 0] == BOS).any().item():
-            raise ValueError("`targets` should be right-shifted, and therefore not begin with BOS!")
-
         B = encoder_outputs.size(0)
         T_src = encoder_outputs.size(1)
         T_tgt = targets.size(1) if targets is not None else None
@@ -498,29 +479,29 @@ class TransformerApproximator(nn.Module):
             predictions = self.project(decoder_outputs)
             return predictions
 
-        predictions = torch.cat([bos((B, 1)), pad((B, T_max))], dim=1).to(D)
+        predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)
         decoder_input = bos((B, 1)).to(D)
 
         finished = torch.zeros((B,), dtype=torch.bool, device=D)
-        for i in range(self.max_length - 1):
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(i + 1, D, torch.bool)
+        for i in range(1, self.max_length - 1):
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(i, D, torch.bool)
             decoder_embeddings = self.embed(decoder_input)
             decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, tgt_is_causal=True)
 
             prediction = self.project(decoder_output)
             prediction = prediction[:, -1]
-            predictions[:, i + 1] = prediction
+            predictions[:, i] = prediction
 
             if (finished := finished | (prediction == PAD)).all():
                 break
 
             use_teacher_forcing = targets is not None and random.random() < ratio
             if use_teacher_forcing:
-                decoder_input = targets[:, :i]
+                decoder_input = targets[:, :i + 1]
             else:
                 decoder_input = predictions[:, :i + 1]
 
-        return predictions
+        return predictions[:, 1:]
 
     def project(self, output: Tensor) -> Tensor:
         if output.dim() != 3:
@@ -546,7 +527,7 @@ class TransformerApproximator(nn.Module):
         return torch.load(file, **kwds)
 
 
-class ApproximatorTrainer(Seq2SeqTrainer):
+class ApproximatorTrainer(Trainer):
 
     model: RecurrentApproximator | TransformerApproximator
     tr_dataset: ApproximatorDataset
@@ -564,11 +545,13 @@ class ApproximatorTrainer(Seq2SeqTrainer):
     def create_stopper(self) -> None:
         return None
 
+    def create_teacher_ratio_scheduler(self) -> TeacherRatioScheduler:
+        return TeacherRatioScheduler(self.args.epochs, self.args.teacher_ratio_start, self.args.teacher_ratio_end)
+
     def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred = self.model.forward(x, y[:, :-1])
-        y_pred = y_pred[:, 1:] if y_pred.size(1) == y.size(1) else y_pred  # trim for recurrent models
+        y_pred = self.model.forward(x, y[:, :-1], ratio=self.teacher_ratio_scheduler.ratio)
         return (y_pred,)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
@@ -577,45 +560,36 @@ class ApproximatorTrainer(Seq2SeqTrainer):
         loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
         return loss, {}
 
-    def translate(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
-        x = batch[0].to(self.args.device)
-        y = self.model.translate(x, 256, "greedy", noise_level=1.03e-2)
-        return (y,)
-
-    def compute_metrics_translate(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> dict[str, float]:
-        y_true = batch[1].to(self.args.device)
-        y_pred = outputs[0].to(self.args.device)
-
-        mask: Tensor = (y_true != PAD) & (y_true != BOS) & (y_true != EOS)
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-
-        mae = nn.L1Loss().forward(y_pred, y_true).item()
-        mse = nn.MSELoss().forward(y_pred, y_true).item()
-
-        return {"mse": mse, "mae": mae}
-
-    def get_gn_dataloader(self) -> DataLoader:
-        gn_dataset = Subset(self.vl_dataset, list(range(len(self.vl_dataset) // 4)))
-        return self.get_dataloader(gn_dataset, self.args.vl_batch_size, False)
-
 
 class OutputHelper:
 
-    def __init__(self, root: Path, pair_mode: str, arch: str, arch_config: str, max_length: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        pair_mode: str,
+        arch: str,
+        arch_config: str,
+        max_length: int,
+        teacher_ratio_start: float,
+        teacher_ratio_end: float,
+    ) -> None:
         self.root = root
         self.pair_mode = pair_mode
         self.arch = arch
         self.arch_config = arch_config
         self.max_length = max_length
+        self.teacher_ratio_start = teacher_ratio_start
+        self.teacher_ratio_end = teacher_ratio_end
 
     @property
     def path(self) -> Path:
         args = [
             f"pair_mode--{self.pair_mode}",
+            f"max_length--{self.max_length}",
             f"arch--{self.arch}",
             f"arch_config--{self.arch_config}",
-            f"max_length--{self.max_length}",
+            f"teacher_ratio_start--{self.teacher_ratio_start}",
+            f"teacher_ratio_end--{self.teacher_ratio_end}",
         ]
         return Path(self.root).joinpath(*args) / "results"
 
@@ -640,7 +614,15 @@ def main() -> None:
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
     print("-" * 80)
 
-    oh = OutputHelper(args.outdir, args.pair_mode, args.arch, args.arch_config, args.max_length)
+    oh = OutputHelper(
+        args.outdir,
+        args.pair_mode,
+        args.arch,
+        args.arch_config,
+        args.max_length,
+        args.teacher_ratio_start,
+        args.teacher_ratio_end,
+    )
 
     seed_everything(args.seed)
 
@@ -690,6 +672,8 @@ def main() -> None:
         logging_steps=args.logging_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         find_executable_batch_size=args.find_executable_batch_size,
+        teacher_ratio_start=args.teacher_ratio_start,
+        teacher_ratio_end=args.teacher_ratio_end,
     )
     trainer = ApproximatorTrainer(
         trainer_args,

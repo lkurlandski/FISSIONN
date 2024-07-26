@@ -44,6 +44,8 @@ class TrainerArgs:
     max_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     find_executable_batch_size: bool = False
+    teacher_ratio_start: float = 1.0
+    teacher_ratio_end: float = 1.0
 
 
 class TrainerArgumentParser(ArgumentParser):
@@ -64,6 +66,8 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--max_norm", type=float, default=1.0)
         self.add_argument("--gradient_accumulation_steps", type=int, default=1)
         self.add_argument("--find_executable_batch_size", action="store_true")
+        self.add_argument("--teacher_ratio_start", type=float, default=1.0)
+        self.add_argument("--teacher_ratio_end", type=float, default=1.0)
 
 
 class EarlyStopper:
@@ -94,6 +98,23 @@ class EarlyStopper:
         return self.count >= self.patience
 
 
+class TeacherRatioScheduler:
+
+    def __init__(self, epochs: int, start: float = 1.0, end: float = 0.0) -> None:
+        self.epochs = epochs
+        self.start = start
+        self.end = end
+        self.ratios = torch.linspace(start, end, epochs).tolist()
+        self.idx = 0
+
+    def step(self):
+        self.idx += 1
+
+    @property
+    def ratio(self) -> float:
+        return self.ratios[self.idx]
+
+
 class Trainer(ABC):
     """A generic Trainer class for training models.
     
@@ -122,6 +143,7 @@ class Trainer(ABC):
         self.optimizer = self.create_optimizer()
         self.scheduler = self.create_scheduler()
         self.stopper = self.create_stopper()
+        self.teacher_ratio_scheduler = self.create_teacher_ratio_scheduler()
         self.log = []
         self.best_epoch = -1
         self.best_metric = -sys.maxsize if args.lower_is_worse else sys.maxsize
@@ -135,6 +157,9 @@ class Trainer(ABC):
     def create_stopper(self) -> Optional[EarlyStopper]:
         return None
 
+    def create_teacher_ratio_scheduler(self) -> Optional[TeacherRatioScheduler]:
+        return None
+
     def __call__(self) -> Self:
         shutil.rmtree(self.args.outdir, ignore_errors=True)
         self.args.outdir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +168,7 @@ class Trainer(ABC):
             starting_batch_size=self.args.vl_batch_size,
             starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
         )
-        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
+        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:  # pylint: disable=unused-argument
             nonlocal self
             self.args.vl_batch_size = batch_size
             return self.evaluate()
@@ -164,7 +189,8 @@ class Trainer(ABC):
 
         tr_metrics = {k: float("nan") for k in self.tr_metric_keys}
         vl_metrics = evaluate()
-        d = {"epoch": 0, "learning_rate": float("nan")} | tr_metrics | vl_metrics
+        teacher_ratio = None if self.teacher_ratio_scheduler is None else self.teacher_ratio_scheduler.ratio
+        d = {"epoch": 0, "learning_rate": float("nan"), "teacher_ratio": float("nan")} | tr_metrics | vl_metrics
         self.update_logs(d)
         self.update_best(d)
         self.update_save(d)
@@ -174,7 +200,8 @@ class Trainer(ABC):
             tr_metrics = train()
             vl_metrics = evaluate()
             learning_rate = self.scheduler.get_last_lr()[0] if self.scheduler is not None else self.args.learning_rate
-            d = {"epoch": epoch, "learning_rate": learning_rate} | tr_metrics | vl_metrics
+            teacher_ratio = None if self.teacher_ratio_scheduler is None else self.teacher_ratio_scheduler.ratio
+            d = {"epoch": epoch, "learning_rate": learning_rate, "teacher_ratio": teacher_ratio} | tr_metrics | vl_metrics
             self.update_logs(d)
             self.update_best(d)
             self.update_save(d)
@@ -187,8 +214,10 @@ class Trainer(ABC):
                 self.stopper.step(vl_metrics[self.args.metric])
                 if self.stopper.stop:
                     break
+            if self.teacher_ratio_scheduler is not None:
+                self.teacher_ratio_scheduler.step()
             if any(math.isnan(d[m]) or math.isinf(d[m]) for m in ("tr_loss", "vl_loss")):
-                raise ValueError(f"NaN/Inf Loss Detected!")
+                raise ValueError("NaN/Inf Loss Detected!")
 
     def evaluate_saved_models(self) -> None:
 
@@ -196,7 +225,7 @@ class Trainer(ABC):
             starting_batch_size=self.args.vl_batch_size,
             starting_gradient_accumulation_steps=self.args.gradient_accumulation_steps,
         )
-        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:
+        def evaluate(batch_size: int, gradient_accumulation_steps: int) -> dict[str, float]:  # pylint: disable=unused-argument
             nonlocal self
             self.args.vl_batch_size = batch_size
             return self.evaluate()
@@ -240,7 +269,6 @@ class Trainer(ABC):
             e = int(checkpoint.stem.split("_")[1])
             if e not in (self.best_epoch, results["epoch"]):
                 ...
-                # checkpoint.unlink()
 
     def train(self) -> dict[str, float]:
         t_0 = time.time()
@@ -285,7 +313,7 @@ class Trainer(ABC):
             if condition_1 and condition_2 and condition_3:
                 d = {"step": step}
                 for k, v in results.items():
-                    start = (step - self.args.logging_steps)
+                    start = step - self.args.logging_steps
                     stop = start + self.args.logging_steps
                     d[f"_{k}"] = mean(v[start:stop])
                 print(self._fmt_dict(d))
@@ -347,7 +375,7 @@ class Trainer(ABC):
             dict[str, float]: auxillary losses over the batch.
         """
 
-    def compute_metrics(self, batch: tuple, outputs: tuple) -> dict[str, float]:
+    def compute_metrics(self, batch: tuple, outputs: tuple) -> dict[str, float]:  # pylint: disable=unused-argument
         """Compute the validation metrics over a batch of examples.
 
         Args:
@@ -384,57 +412,3 @@ class Trainer(ABC):
 
     def _fmt_dict(self, d: dict[str, float]) -> dict[str, str]:
         return {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in d.items()}
-
-
-class Seq2SeqTrainer(Trainer):
-
-    def evaluate(self) -> dict[str, float]:
-
-        basal_results = super().evaluate()
-
-        t_0 = time.time()
-        results: defaultdict[str, list[float]] = defaultdict(list)
-        self.model.eval()
-        dataloader = self.get_gn_dataloader()
-        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size)
-        with torch.no_grad():
-            for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
-                outputs = self.translate(batch)
-                # if step == 0:
-                #     print([f"{i:.2e}" for i in outputs[0][0].tolist()])
-                metrics = self.compute_metrics_translate(batch, outputs)
-                for k, v in metrics.items():
-                    results[f"gn_{k}"].append(v)
-
-        for k, v in results.items():
-            results[k] = mean(v)
-        results["gn_time"] = time.time() - t_0
-
-        return basal_results | dict(results)
-
-    @abstractmethod
-    def translate(self, batch: tuple) -> tuple:
-        """Translate a batch of inputs through the model.
-
-        Args:
-            batch (tuple): batch of inputs.
-
-        Returns:
-            tuple: model output(s), e.g., a predicted sequence.
-        """
-
-    def compute_metrics_translate(self, batch: tuple, outputs: tuple) -> dict[str, float]:
-        """Compute the validation metrics over a batch of examples.
-
-        Args:
-            batch (tuple): batch of inputs.
-            outputs (tuple): model output(s), e.g., logits, as return by self.forward.
-            loss (Tensor): model loss over the batch.
-
-        Returns:
-            dict[str, float]: metrics for the batch.
-        """
-        return {}
-
-    def get_gn_dataloader(self) -> DataLoader:
-        return self.get_vl_dataloader()
