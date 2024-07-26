@@ -87,6 +87,10 @@ BOS = -10001.0
 EOS = -10002.0
 
 
+def pad(shape: tuple[int]) -> Tensor:
+    return torch.full(shape, PAD)
+
+
 def bos(shape: tuple[int]) -> Tensor:
     return torch.full(shape, BOS)
 
@@ -322,65 +326,61 @@ class RecurrentApproximator(nn.Module):
         targets: Optional[Tensor] = None,
         ratio: float = 1.0,
     ) -> Tensor:
-        decoder_hidden = encoder_hidden                                               # (L, B, H)
-        decoder_input = bos((encoder_outputs.size(0), 1)).to(encoder_outputs.device)  # (B, 1)
-    
-        decoder_outputs, attentions = [], []
-        for i in range(self.max_length):
-            decoder_output, decoder_hidden, attn_weights = self.decode_step(
-                decoder_input,
-                decoder_hidden,
-                encoder_outputs,
-            )
-    
-            decoder_outputs.append(decoder_output)
-            attentions.append(attn_weights)
-    
-            if targets is not None and random.random() < ratio:
-                decoder_input = targets[:, i].unsqueeze(1)
+
+        TEACHER_FORCING_ENTIRE_SEQUENCE = False  # TODO: if True, the size comments may be incorrect
+
+        B = encoder_outputs.size(0)
+        T = encoder_outputs.size(1)
+        D = encoder_outputs.device
+
+        decoder_hidden = encoder_hidden                                       # (L, B, H)
+        predictions = torch.cat([bos((B, 1)), pad((B, T - 1))], dim=1).to(D)  # (B, T)
+        attentions = torch.zeros((B, T, self.max_length), device=D)           # (B, T, 2 * H)
+        decoder_input = bos((B, 1)).to(D)                                     # (B, 1)
+
+        for l in range(self.max_length - 1):
+
+            embeddings = self.embed(decoder_input)                        # (B, 1, H)
+            final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
+
+            context, attention = self.attention.forward(final_hidden_state, encoder_outputs)           # (B, 1, H), (B, 1, 2 * H)
+            decoder_embeddings = torch.cat((embeddings, context), dim=2)                               # (B, 1, 2 * H)
+            decoder_output, decoder_hidden = self.decoder.forward(decoder_embeddings, decoder_hidden)  # (B, 1, H), (L, B, H)
+
+            prediction = self.project(decoder_output)  # (B, T)
+            prediction = prediction[:, -1]             # (B,)
+            predictions[:,l] = prediction              # (B, T)
+            attentions[:,l,:] = attention.squeeze(1)   # (B, T, 2 * H)
+
+            # Teacher Forcing: randomly use the ground truth target as the next input to the decoder.
+            # If TEACHER_FORCING_ENTIRE_SEQUENCE is True, the entire target sequence is used as input.
+            # Otherwise, only the most recent predictions is used.
+            use_teacher_forcing = targets is not None and random.random() < ratio
+            if use_teacher_forcing:
+                if TEACHER_FORCING_ENTIRE_SEQUENCE:
+                    decoder_input = targets[:, :l + 1]          # (B, l)
+                else:
+                    decoder_input = targets[:, l].unsqueeze(1)  # (B, 1)
             else:
-                _, topi = decoder_output.topk(1)
-                decoder_input = topi.squeeze(-1).detach()
+                if TEACHER_FORCING_ENTIRE_SEQUENCE:
+                    decoder_input = predictions[:, :l + 1]      # (B, l)
+                else:
+                    decoder_input = prediction.unsqueeze(1)     # (B, 1)
 
-        decoder_outputs = torch.cat(decoder_outputs, dim=1)
-        decoder_outputs = F.log_softmax(decoder_outputs, dim=-1)
-        attentions = torch.cat(attentions, dim=1)
-
-        return decoder_outputs, decoder_hidden, attentions
-
-    def decode_step(
-        self,
-        inputs: Tensor,
-        hidden: Tensor,
-        encoder_outputs: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        embeddings = self.embed(inputs)          # (B, 1, H)
-        query = hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
-
-        context, attn_weights = self.attention.forward(query, encoder_outputs)  # (B, 1, H), (B, 1, 2 * H)
-        decoder_inputs = torch.cat((embeddings, context), dim=2)                # (B, 1, 2 * H)
-        output, hidden = self.decoder.forward(decoder_inputs, hidden)           # (B, 1, H), (L, B, H)
-
-        return output, hidden, attn_weights
+        return predictions, decoder_hidden, attentions
 
     def project(self, output: Tensor) -> Tensor:
         if output.dim() != 3:
-            raise ShapeError((x.shape), ("B", "L", "H"))
+            raise ShapeError((output.shape), ("B", "L", "H"))
         x = self.head.forward(output)
-        x = x.unsqueeze(2)
+        x = x.squeeze(2)
         return x
 
     def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, ratio: float = 1.0) -> Tensor:
-
-        embeddings = self.embed(inputs)                            # (B, L, H)
-        encoder_outputs, encoder_hidden = self.encode(embeddings)  # (B, L, H), (L, B, H)
-        decoder_outputs, decoder_hidden, attentions = self.decode(
-            encoder_outputs,
-            encoder_hidden,
-            targets,
-            ratio,
-        )
-        
+        embeddings = self.embed(inputs)                                                # (B, L, H)
+        encoder_outputs, encoder_hidden = self.encode(embeddings)                      # (B, L, H), (L, B, H)
+        predictions = self.decode(encoder_outputs, encoder_hidden, targets, ratio)[0]  # (B, T)
+        return predictions
 
 
 class PositionalEncoding(nn.Module):
