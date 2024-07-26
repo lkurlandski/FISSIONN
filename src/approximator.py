@@ -9,6 +9,11 @@ Sources
 - "Language Translation with nn.Transformer and torchtext"
   (https://pytorch.org/tutorials/beginner/translation_transformer.html)
 
+Notes
+-----
+- When decoding with RNNs, only the most recently generated token is fed back into the model because
+  the hidden state carries information from preceding tokens. When decoding with Transformers, the
+  entire generated sequence is fed back into the model.
 
 Overflow Issue
 --------------
@@ -84,7 +89,6 @@ BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
 PAD = -10000.0
 BOS = -10001.0
-EOS = -10002.0
 
 
 def pad(shape: tuple[int]) -> Tensor:
@@ -93,10 +97,6 @@ def pad(shape: tuple[int]) -> Tensor:
 
 def bos(shape: tuple[int]) -> Tensor:
     return torch.full(shape, BOS)
-
-
-def eos(shape: tuple[int]) -> Tensor:
-    return torch.full(shape, EOS)
 
 
 class ApproximatorDataset(Dataset):
@@ -202,14 +202,13 @@ class ApproximatorCollateFn:
 
     def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
         b = bos((1,))
-        e = eos((1,))
         x = []
         y = []
         for x_, y_ in batch:
             x_ = x_[0 : self.max_length - 2]
             y_ = y_[0 : self.max_length - 2]
-            x.append(torch.cat([b, x_, e]))
-            y.append(torch.cat([b, y_, e]))
+            x.append(torch.cat([b, x_]))
+            y.append(torch.cat([b, y_]))
         x = pad_sequence(x, batch_first=True, padding_value=PAD)
         y = pad_sequence(y, batch_first=True, padding_value=PAD)
         return x, y
@@ -262,9 +261,9 @@ class RecurrentApproximator(nn.Module):
 
     # B - batch size
     # T - sequence length
-    # I - input size
     # H - hidden size
     # L - num layers
+    # I - input size
 
     PUNY = {"hidden_size": 64, "num_layers": 1}
     TINY = {"hidden_size": 128, "num_layers": 2}
@@ -309,13 +308,15 @@ class RecurrentApproximator(nn.Module):
 
     def embed(self, inputs: Tensor) -> Tensor:
         if inputs.dim() != 2:
-            raise ShapeError((inputs.shape), ("B", "L"))
+            raise ShapeError((inputs.shape), ("B", "T"))
         x = inputs.unsqueeze(2)
         x = self.embedding.forward(x)
         x = self.dropout.forward(x)
         return x
 
     def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor]:
+        if embeddings.dim() != 3:
+            raise ShapeError((embeddings.shape), ("B", "T", "H"))
         x = self.encoder.forward(embeddings)
         return x
 
@@ -326,52 +327,59 @@ class RecurrentApproximator(nn.Module):
         targets: Optional[Tensor] = None,
         ratio: float = 1.0,
     ) -> Tensor:
+        if encoder_outputs.dim() != 3:
+            raise ShapeError((encoder_outputs.shape), ("B", "L", "H"))
+        if encoder_hidden.dim() != 3:
+            raise ShapeError((encoder_hidden.shape), ("L", "B", "H"))
+        if targets is not None and targets.dim() != 2:
+            raise ShapeError((targets.shape), ("B", "T - 1"))
 
-        TEACHER_FORCING_ENTIRE_SEQUENCE = False  # TODO: if True, the size comments may be incorrect
+        # `targets` should be right-shifted by one position, e.g., targets[:, :-1].
+        # Therefore, `targets[i - 1]` is the ground truth for `predictions[i]`.
+        if targets is not None and (targets[:, 0] == BOS).any().item():
+            raise ValueError("`targets` should be right-shifted, and therefore not begin with BOS!")
 
         B = encoder_outputs.size(0)
-        T = encoder_outputs.size(1)
+        T_src = encoder_outputs.size(1)
+        T_tgt = targets.size(1) if targets is not None else None
+        T_max = self.max_length
         D = encoder_outputs.device
 
-        decoder_hidden = encoder_hidden                                       # (L, B, H)
-        predictions = torch.cat([bos((B, 1)), pad((B, T - 1))], dim=1).to(D)  # (B, T)
-        attentions = torch.zeros((B, T, self.max_length), device=D)           # (B, T, 2 * H)
-        decoder_input = bos((B, 1)).to(D)                                     # (B, 1)
+        decoder_hidden = encoder_hidden                                           # (L, B, H)
+        predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)  # (B, T_max)
+        decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
 
-        for l in range(self.max_length - 1):
+        finished = torch.zeros((B,), dtype=torch.bool, device=D)
+        for i in range(self.max_length - 1):
 
             embeddings = self.embed(decoder_input)                        # (B, 1, H)
             final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
 
-            context, attention = self.attention.forward(final_hidden_state, encoder_outputs)           # (B, 1, H), (B, 1, 2 * H)
+            context, _ = self.attention.forward(final_hidden_state, encoder_outputs)                   # (B, 1, H), (B, 1, 2 * H)
             decoder_embeddings = torch.cat((embeddings, context), dim=2)                               # (B, 1, 2 * H)
             decoder_output, decoder_hidden = self.decoder.forward(decoder_embeddings, decoder_hidden)  # (B, 1, H), (L, B, H)
 
             prediction = self.project(decoder_output)  # (B, T)
             prediction = prediction[:, -1]             # (B,)
-            predictions[:,l] = prediction              # (B, T)
-            attentions[:,l,:] = attention.squeeze(1)   # (B, T, 2 * H)
+            predictions[:,i + 1] = prediction          # (B, T)
 
-            # Teacher Forcing: randomly use the ground truth target as the next input to the decoder.
-            # If TEACHER_FORCING_ENTIRE_SEQUENCE is True, the entire target sequence is used as input.
-            # Otherwise, only the most recent predictions is used.
+            if (finished := finished | (prediction == PAD)).all():
+                break
+
             use_teacher_forcing = targets is not None and random.random() < ratio
             if use_teacher_forcing:
-                if TEACHER_FORCING_ENTIRE_SEQUENCE:
-                    decoder_input = targets[:, :l + 1]          # (B, l)
+                if i < T_tgt:
+                    decoder_input = targets[:, i].unsqueeze(1)
                 else:
-                    decoder_input = targets[:, l].unsqueeze(1)  # (B, 1)
+                    decoder_input = pad((B, 1)).to(D)
             else:
-                if TEACHER_FORCING_ENTIRE_SEQUENCE:
-                    decoder_input = predictions[:, :l + 1]      # (B, l)
-                else:
-                    decoder_input = prediction.unsqueeze(1)     # (B, 1)
+                decoder_input = prediction.unsqueeze(1)
 
-        return predictions, decoder_hidden, attentions
+        return predictions, decoder_hidden
 
     def project(self, output: Tensor) -> Tensor:
         if output.dim() != 3:
-            raise ShapeError((output.shape), ("B", "L", "H"))
+            raise ShapeError((output.shape), ("B", "T", "H"))
         x = self.head.forward(output)
         x = x.squeeze(2)
         return x
@@ -388,6 +396,9 @@ class PositionalEncoding(nn.Module):
     embedding: Tensor
 
     def __init__(self, emb_size: int, max_length: int, dropout: float = 0.1) -> None:
+        if emb_size % 2 != 0:
+            raise ValueError(f"The embedding size {emb_size=} must be divisible by 2.")
+
         super().__init__()
         den = torch.exp(- torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
         pos = torch.arange(0, max_length).reshape(max_length, 1)
@@ -409,6 +420,12 @@ class PositionalEncoding(nn.Module):
 
 class TransformerApproximator(nn.Module):
 
+    # B - batch size
+    # T - sequence length
+    # H - hidden size
+    # L - num layers
+    # N - num heads
+
     PUNY = {"hidden_size": 64, "num_layers": 1, "nhead": 1, "intermediate_size": 256}
     TINY = {"hidden_size": 128, "num_layers": 2, "nhead": 2, "intermediate_size": 512}
     SMALL = {"hidden_size": 256, "num_layers": 4, "nhead": 4, "intermediate_size": 1024}
@@ -422,226 +439,111 @@ class TransformerApproximator(nn.Module):
         hidden_size: int,
         num_layers: int,
         nhead: int,
-        intermediate_size: Optional[int] = None,
+        intermediate_size: int,
     ) -> None:
         super().__init__()
-        intermediate_size = intermediate_size if intermediate_size is not None else 4 * hidden_size
-        self.projection_in = nn.Linear(1, hidden_size)
-        self.positional_embedding = PositionalEncoding(hidden_size, max_length)
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                hidden_size, nhead, intermediate_size, batch_first=True,
-            ),
-            num_layers,
-        )
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                hidden_size, nhead, intermediate_size, batch_first=True,
-            ),
-            num_layers,
-        )
-        self.projection_out = nn.Linear(hidden_size, 1)
+        self.max_length = max_length
+        self.embedding = nn.Linear(1, hidden_size)
+        self.positional_encoding = PositionalEncoding(hidden_size, max_length)
+        self.dropout = nn.Dropout(0.1)
+        encoder_layer = nn.TransformerEncoderLayer(hidden_size, nhead, intermediate_size, batch_first=True)
+        decoder_layer = nn.TransformerDecoderLayer(hidden_size, nhead, intermediate_size, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
+        self.head = nn.Linear(hidden_size, 1)
 
-    def forward(
+    def embed(self, inputs: Tensor) -> Tensor:
+        if inputs.dim() != 2:
+            raise ShapeError((inputs.shape), ("B", "T"))
+        x = inputs.unsqueeze(2)
+        x = self.embedding.forward(x)
+        x = self.positional_encoding.forward(x)
+        x = self.dropout.forward(x)
+        return x
+
+    def encode(self, embeddings: Tensor, mask: Optional[Tensor], padding_mask: Optional[Tensor]) -> Tensor:
+        if embeddings.dim() != 3:
+            raise ShapeError((embeddings.shape), ("B", "T", "H"))
+        x = self.encoder.forward(embeddings, mask, padding_mask, is_causal=False)
+        return x
+
+    def decode(
         self,
-        x: Optional[Tensor] = None,
-        y: Optional[Tensor] = None,
-        mem: Optional[Tensor] = None,
+        encoder_outputs: Tensor,
+        targets: Optional[Tensor] = None,
+        ratio: float = 1.0,
     ) -> Tensor:
-        if x is not None:
-            if x.dim() != 2:
-                raise ShapeError((x.shape), ("B", "L"))
-        if y is not None:
-            if y.dim() != 2:
-                raise ShapeError((y.shape), ("B", "L"))
-        if mem is not None:
-            if mem.dim() != 3:
-                raise ShapeError((mem.shape), ("B", "L", "H"))
 
-        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = self.create_mask(x, y, x.device)
+        if encoder_outputs.dim() != 3:
+            raise ShapeError((encoder_outputs.shape), ("B", "T", "H"))
+        if targets is not None and targets.dim() != 2:
+            raise ShapeError((targets.shape), ("B", "T - 1"))
 
-        if mem is None:
-            src = self.embed(x)
-            mem = self.encoder.forward(src, src_mask, src_padding_mask)
+        # `targets` should be right-shifted by one position, e.g., targets[:, :-1].
+        # Therefore, `targets[i - 1]` is the ground truth for `predictions[i]`.
+        if targets is not None and (targets[:, 0] == BOS).any().item():
+            raise ValueError("`targets` should be right-shifted, and therefore not begin with BOS!")
 
-        tgt = self.embed(y)
-        out = self.decoder.forward(tgt, mem, tgt_mask, None, tgt_padding_mask)
-        y_pred = self.projection_out.forward(out).squeeze(2)
+        B = encoder_outputs.size(0)
+        T_src = encoder_outputs.size(1)
+        T_tgt = targets.size(1) if targets is not None else None
+        T_max = self.max_length
+        D = encoder_outputs.device
 
-        return y_pred
+        if targets is not None and ratio == 1.0:
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(T_tgt, device=D, dtype=bool)
+            tgt_padding_mask = (targets == PAD).to(D)  # (B, T)
+            decoder_embeddings = self.embed(targets)   # (B, T, H)
+            decoder_outputs = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, None, tgt_padding_mask, tgt_is_causal=True)
+            predictions = self.project(decoder_outputs)
+            return predictions
 
-    def embed(self, t: Tensor) -> Tensor:
-        if t.dim() != 2:
-            raise ShapeError((t.shape), ("B", "L"))
-        t = t.unsqueeze(2)
-        t = self.projection_in.forward(t)
-        t = self.positional_embedding.forward(t)
-        return t
+        predictions = torch.cat([bos((B, 1)), pad((B, T_max))], dim=1).to(D)
+        decoder_input = bos((B, 1)).to(D)
+
+        finished = torch.zeros((B,), dtype=torch.bool, device=D)
+        for i in range(self.max_length - 1):
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(i + 1, D, torch.bool)
+            decoder_embeddings = self.embed(decoder_input)
+            decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, tgt_is_causal=True)
+
+            prediction = self.project(decoder_output)
+            prediction = prediction[:, -1]
+            predictions[:, i + 1] = prediction
+
+            if (finished := finished | (prediction == PAD)).all():
+                break
+
+            use_teacher_forcing = targets is not None and random.random() < ratio
+            if use_teacher_forcing:
+                decoder_input = targets[:, :i]
+            else:
+                decoder_input = predictions[:, :i + 1]
+
+        return predictions
+
+    def project(self, output: Tensor) -> Tensor:
+        if output.dim() != 3:
+            raise ShapeError((output.shape), ("B", "T", "H"))
+        x = self.head.forward(output)
+        x = x.squeeze(2)
+        return x
+
+    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, ratio: float = 1.0) -> Tensor:
+
+        src_mask = torch.zeros(
+            (inputs.size(1), inputs.size(1)), dtype=torch.bool, device=inputs.device
+        )
+        src_padding_mask = (inputs == PAD).to(inputs.device)
+
+        embeddings = self.embed(inputs)
+        encoder_outputs = self.encode(embeddings, src_mask, src_padding_mask)
+        predictions = self.decode(encoder_outputs, targets, ratio)
+        return predictions
 
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> TransformerApproximator:
         return torch.load(file, **kwds)
-
-    @staticmethod
-    def create_mask(
-        x: Tensor, y: Tensor, device: Optional[torch.cuda.device] = None,
-    ) -> tuple[BoolTensor, BoolTensor, BoolTensor, BoolTensor]:
-        # Positions with a True value are not allowed to participate in the attention
-        l_x = x.size(1)
-        l_y = y.size(1)
-
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(l_y, device=device, dtype=torch.bool)
-        src_mask = torch.zeros((l_x, l_x), dtype=torch.bool, device=device)
-
-        src_padding_mask = (x == PAD).to(device)
-        tgt_padding_mask = (y == PAD).to(device)
-
-        return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
-
-    def beam_search(self, x: Tensor, max_length: int, num_beams: int) -> Tensor:
-
-        raise NotImplementedError("Beam Search algorithm requires a means to score the value of beams.")
-
-        N = num_beams
-        B = x.size(0)
-        L = x.size(1)
-        D = x.device
-
-        # Initial embedding and encoding of the source sequence
-        src = self.embed(x)                                          # (B, L, H)
-        src_mask = torch.zeros((L, L), dtype=torch.bool, device=D)   # (L, L)
-        src_padding_mask = (x == PAD).to(D)                          # (B, L)
-        mem = self.encoder.forward(src, src_mask, src_padding_mask)  # (B, L, H)
-
-        # Initialize the beam search
-        y = bos((B * N, 1)).to(D)                                          # (B * N, 1)
-        scores = torch.zeros((B * N, 1), device=D)                         # (B * N, 1)
-        generated_eos = torch.zeros((B * N,), dtype=torch.bool, device=D)  # (B * N)
-
-        # Expand memory to accommodate beam size
-        mem = mem.repeat_interleave(N, dim=0)  # (B * N, L, H)
-
-        for l in range(1, max_length - 1):
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(l, D, torch.bool)  # (l, l)
-            tgt = self.embed(y)                                                          # (B * N, l, H)
-            out = self.decoder.forward(tgt, mem, tgt_mask)                               # (B * N, l, H)
-            y_pred = self.projection_out(out).squeeze(2)                                 # (B * N, l)
-
-            # Compute scores and update beam
-            # log_probs = torch.log_softmax(y_pred[:, -1], dim=-1)         # (B * N,)
-            # scores = scores + log_probs                                  # (B * N, B * N)
-            pred_next = y_pred[:, -1]                                      # (B * N,)
-            abs_error = torch.abs(pred_next.unsqueeze(1) - y_pred[:, -1])  # (B * N, 1)
-            scores = scores - abs_error                                    # (B * N, 1)
-            scores = scores + abs_error                                    # (B * N, B * N)
-
-            # Flatten scores for easy topk selection
-            # scores = scores.view(B, N * log_probs.size(-1))            # (B, B * N * N)
-            # topk_scores, topk_indices = torch.topk(scores, N, dim=-1)  # (B, N), (B, N)
-            scores = scores.view(B, N * pred_next.size(-1))              # (B, N * N)
-            topk_scores, topk_indices = torch.topk(scores, N, dim=-1)    # (B, N)
-
-            # Determine the corresponding beams and vocabulary indices
-            # beam_indices = topk_indices // log_probs.size(-1)          # (B, N)
-            # vocab_indices = topk_indices % log_probs.size(-1)          # (B, N)
-            beam_indices = topk_indices // pred_next.size(-1)            # (B, N)
-            real_values = pred_next[topk_indices % pred_next.size(-1)]   # (B, N)
-
-            # Update the beam search variables
-            y = y.view(B, N, -1)                                                           # (B, N, l)
-            y = torch.gather(y, 1, beam_indices.unsqueeze(-1).expand(-1, -1, y.size(-1)))  # (B, N, l)
-            y = y.view(B * N, -1)                                                          # (B * N, l)
-            # y = torch.cat([y, vocab_indices.view(-1, 1)], dim=-1)                        # (B * N, l + 1)
-            y = torch.cat([y, real_values.view(-1, 1)], dim=-1)                            # (B * N, l + 1)
-
-            scores = topk_scores.view(B * N, 1)                                # (B * N, 1)
-            # generated_eos = generated_eos | (vocab_indices.view(-1) == EOS)  # (B * N)
-            generated_eos = generated_eos | (real_values.view(-1) == EOS)      # (B * N)
-
-            if generated_eos.all():
-                break
-
-        # Select the best beam for each sequence
-        y = y.view(B, N, -1)                                                               # (B, N, L - 1)
-        scores = scores.view(B, N)                                                         # (B, N)
-        best_beam_indices = torch.argmax(scores, dim=-1)                                   # (B,)
-        y = torch.cat([y[i, best_beam_indices[i]].unsqueeze(0) for i in range(B)], dim=0)  # (B, L - 1)
-
-        # Add EOS to the sequences which have not generated EOS yet. Else add PAD.
-        final = eos((B,)).to(D)                            # (B,)
-        final[~generated_eos.view(B, N).any(dim=1)] = PAD  # (B,)
-        y = torch.cat([y, final.unsqueeze(1)], dim=1)      # (B, L)
-
-        return y
-
-    def greedy_decode(self, x: Tensor, max_length: int, noise_level: Optional[float] = None) -> Tensor:
-
-        _sampler = torch.distributions.Normal(0, noise_level) if noise_level else None
-
-        def add_noise(x: Tensor) -> Tensor:
-            if not noise_level:
-                return x
-            noise = _sampler.sample(x.size()).to(D)
-            noisy_x = x + noise
-            ignore = ((x == PAD) | (x == BOS) | (x == EOS) | (noisy_x < 0))
-            noise[ignore] = 0.0
-            return x + noise
-
-        B = x.size(0)
-        L = x.size(1)
-        D = x.device
-
-        src = self.embed(x)
-        src_mask = torch.zeros((L, L), dtype=torch.bool, device=D)
-        src_padding_mask = (x == PAD).to(D)
-        mem = self.encoder.forward(src, src_mask, src_padding_mask)
-        y = bos((B, 1)).to(D)
-
-        # Tracks which sequences have generated EOS.
-        generated_eos = torch.zeros((B,), dtype=torch.bool, device=D)
-
-        for l in range(1, max_length - 1):
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(l, D, torch.bool)
-            tgt = self.embed(y)
-            out = self.decoder.forward(tgt, mem, tgt_mask)
-
-            y_pred = self.projection_out.forward(out).squeeze(2)
-            y_next = y_pred[:, -1]
-            y_next = add_noise(y_next)
-            y = torch.cat([y, y_next.unsqueeze(1)], dim=1)
-
-            generated_eos = generated_eos | (y_next == EOS)
-            if generated_eos.all():
-                break
-
-        # Add EOS to the sequences which have not generated EOS yet. Else add PAD.
-        final = eos((B,)).to(D)
-        final[~generated_eos] = PAD
-        y = torch.cat([y, final.unsqueeze(1)], dim=1)
-
-        return y
-
-    def translate(
-        self,
-        x: Tensor,
-        max_length: int,
-        alg: Literal["greedy", "beam"],
-        *,
-        noise_level: Optional[float] = None,
-        num_beams: Optional[int] = None,
-    ) -> Tensor:
-        if x.dim() != 2:
-            raise ShapeError((x.shape), ("B", "L"))
-
-        self.eval()
-        with torch.no_grad():
-            if alg == "greedy":
-                y = self.greedy_decode(x, max_length, noise_level)
-            elif alg == "beam":
-                y = self.beam_search(x, max_length, num_beams)
-            else:
-                raise ValueError(f"Invalid Algorithm: {alg}")
-        return y
 
 
 class ApproximatorTrainer(Seq2SeqTrainer):
