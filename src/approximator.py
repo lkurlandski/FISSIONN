@@ -345,7 +345,7 @@ class RecurrentApproximator(nn.Module):
         decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
 
         finished = torch.zeros((B,), dtype=torch.bool, device=D)
-        for i in range(1, self.max_length - 1):
+        for i in range(1, self.max_length):
 
             embeddings = self.embed(decoder_input)                        # (B, 1, H)
             final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
@@ -514,17 +514,17 @@ class TransformerApproximator(nn.Module):
             predictions = self.project(decoder_outputs)
             return predictions
 
-        predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)
-        decoder_input = bos((B, 1)).to(D)
+        predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)  # (B, T_max)
+        decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
+        finished = torch.zeros((B,), dtype=torch.bool, device=D)                  # (B,)
 
-        finished = torch.zeros((B,), dtype=torch.bool, device=D)
-        for i in range(1, self.max_length - 1):
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(i, D, torch.bool)
-            decoder_embeddings = self.embed(decoder_input)
-            decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, tgt_is_causal=True)
+        for i in range(1, self.max_length):
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(i, D, torch.bool)  # (i, i)
+            decoder_embeddings = self.embed(decoder_input)                               # (B, i, H)
+            decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, tgt_is_causal=True)  # (B, i, H)
 
-            prediction = self.project(decoder_output)
-            prediction = prediction[:, -1]
+            prediction = self.project(decoder_output)  # (B, i)
+            prediction = prediction[:, -1]             # (B,)
             predictions[:, i] = prediction
 
             if (finished := finished | (prediction == PAD)).all():
@@ -600,17 +600,28 @@ class ApproximatorTrainer(Trainer):
         y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         return (y_pred,)
 
-    def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
+    def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
-        return (y_pred,)
+        y_pred_tch = self.model.forward(x, y[:, :-1], teacher_force_ratio=1.0)
+        y_pred_gen = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
+        return (y_pred_tch, y_pred_gen)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
         y: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
         loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
         return loss, {}
+
+    def compute_metrics(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Tensor]) -> dict[str, float]:
+        y: Tensor = batch[1].to(self.args.device)
+        y = y[:, 1:]
+        mask = (y != PAD) & (y != BOS)
+        y_pred_tch: Tensor = outputs[0]
+        y_pred_gen: Tensor = outputs[1]
+        loss_tch = self.loss_fn.forward(y_pred_tch[mask], y[mask])
+        loss_gen = self.loss_fn.forward(y_pred_gen[mask], y[mask])
+        return {"loss_tch": loss_tch.item(), "loss_gen": loss_gen.item()}
 
 
 class OutputHelper:
