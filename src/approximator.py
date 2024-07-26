@@ -9,11 +9,13 @@ Sources
 - "Language Translation with nn.Transformer and torchtext"
   (https://pytorch.org/tutorials/beginner/translation_transformer.html)
 
+
 Notes
 -----
 - When decoding with RNNs, only the most recently generated token is fed back into the model because
   the hidden state carries information from preceding tokens. When decoding with Transformers, the
   entire generated sequence is fed back into the model.
+
 
 Overflow Issue
 --------------
@@ -603,7 +605,7 @@ class ApproximatorTrainer(Trainer):
     def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred_tch = self.model.forward(x, y[:, :-1], teacher_force_ratio=1.0)
+        y_pred_tch = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         y_pred_gen = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
         return (y_pred_tch, y_pred_gen)
 
