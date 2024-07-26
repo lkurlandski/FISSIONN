@@ -279,7 +279,7 @@ class Trainer(ABC):
         results: defaultdict[str, list[float]] = defaultdict(lambda: [0] * num_steps)
         step = 0
 
-        pbar = self._get_pbar(dataloader, total=len(dataloader), desc="Training...")
+        pbar = self._get_pbar(dataloader, total=len(dataloader), desc="Training...", leave=False)
         for mini_step, batch in enumerate(pbar):
 
             # Compute normalized loss, skip noisy losses
@@ -331,7 +331,7 @@ class Trainer(ABC):
         results: defaultdict[str, list[float]] = defaultdict(list)
         self.model.eval()
         dataloader = self.get_vl_dataloader()
-        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size, desc="Validating...")
+        pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size, desc="Validating...", leave=False)
         with torch.no_grad():
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
 
