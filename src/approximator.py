@@ -712,7 +712,8 @@ def main() -> None:
         config = {"max_length": args.max_length} | getattr(TransformerApproximator, args.arch_config.upper())
         model = TransformerApproximator(**config)
         if args.arch_config in ("tiny", "small"):
-            BACKEND = SDPBackend.MATH
+            ...
+            # BACKEND = SDPBackend.MATH
     else:
         config = {"max_length": args.max_length} | getattr(RecurrentApproximator, args.arch_config.upper())
         model = RecurrentApproximator(**config)
