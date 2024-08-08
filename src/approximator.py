@@ -237,7 +237,7 @@ class ApproximatorLossFn(nn.Module):
             if not self.allow_different_lengths:
                 raise ShapeError((y_pred.shape, y_true.shape), (("B", "T"), ("B", "T")))
             y_pred = y_pred[:, :y_true.size(1)]
-            padding = pad((y_pred.size(0), y_true.size(1) - y_pred.size(1)))
+            padding = pad((y_pred.size(0), y_true.size(1) - y_pred.size(1))).to(y_pred.device)
             y_pred = torch.cat([y_pred, padding], dim=1)
 
         # Mask out the special tokens. Since MSE takes the mean of the squared differences,
