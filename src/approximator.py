@@ -219,16 +219,31 @@ class ApproximatorCollateFn:
 class ApproximatorLossFn(nn.Module):
     """
     TODO:
-     - Figure out a better way to handle mismatching special tokens.
-     - Figure out a better way to handle mismatching sequence lengths.
+     - Is there a better way to handle mismatching special tokens?
+     - Is there a better way to handle mismatching sequence lengths?
     """
 
-    def __init__(self) -> None:
+    def __init__(self, allow_different_lengths: bool = False) -> None:
         super().__init__()
+        self.allow_different_lengths = allow_different_lengths
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
-        mask = (y_true != PAD) & (y_true != BOS)
+        if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
+            raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
+
+        # If the lengths are different, pad/truncate y_pred to the length of y_true
+        if y_pred.size(1) != y_true.size(1):
+            if not self.allow_different_lengths:
+                raise ShapeError((y_pred.shape, y_true.shape), (("B", "T"), ("B", "T")))
+            y_pred = y_pred[:, :y_true.size(1)]
+            padding = pad((y_pred.size(0), y_true.size(1) - y_pred.size(1)))
+            y_pred = torch.cat([y_pred, padding], dim=1)
+
+        # Mask out the special tokens. Since MSE takes the mean of the squared differences,
+        # masking out the padding tokens will neither help nor hurt the overall loss (I think).
+        mask = (y_true != PAD) & (y_true != BOS) & (y_pred != PAD) & (y_pred != BOS)
+
         return self.loss_fn.forward(y_pred[mask], y_true[mask])
 
 
@@ -618,11 +633,10 @@ class ApproximatorTrainer(Trainer):
     def compute_metrics(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Tensor]) -> dict[str, float]:
         y: Tensor = batch[1].to(self.args.device)
         y = y[:, 1:]
-        mask = (y != PAD) & (y != BOS)
         y_pred_tch: Tensor = outputs[0]
         y_pred_gen: Tensor = outputs[1]
-        loss_tch = self.loss_fn.forward(y_pred_tch[mask], y[mask])
-        loss_gen = self.loss_fn.forward(y_pred_gen[mask], y[mask])
+        loss_tch = self.loss_fn.forward(y_pred_tch, y)
+        loss_gen = self.loss_fn.forward(y_pred_gen, y)
         return {"loss_tch": loss_tch.item(), "loss_gen": loss_gen.item()}
 
 
@@ -725,7 +739,7 @@ def main() -> None:
     print("-" * 80)
 
     collate_fn = ApproximatorCollateFn(max_length=args.max_length)
-    loss_fn = ApproximatorLossFn()
+    loss_fn = ApproximatorLossFn(allow_different_lengths=True)
     trainer_args = TrainerArgs(
         outdir=oh.path,
         device=args.device,
