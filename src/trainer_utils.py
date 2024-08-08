@@ -38,6 +38,7 @@ def find_executable_batch_size(
             "DefaultCPUAllocator: can't allocate memory",
             "CUDA error: an illegal memory access was encountered",
             "Triton Error [CUDA]: an illegal memory access was encountered",
+            "CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
         ]
         if isinstance(exception, RuntimeError) and len(exception.args) == 1:
             return any(err in exception.args[0] for err in statements)
