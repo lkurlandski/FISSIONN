@@ -473,7 +473,7 @@ class PositionalEncoding(nn.Module):
         embedding[:, 0::2] = torch.sin(pos * den)
         embedding[:, 1::2] = torch.cos(pos * den)
         embedding = embedding.unsqueeze(0)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)  # FIXME: remove
         self.register_buffer("embedding", embedding)
 
     def forward(self, t: Tensor):
@@ -481,7 +481,7 @@ class PositionalEncoding(nn.Module):
             raise ShapeError((t.shape), ("B", "L", "H"))
         p = self.embedding[:, :t.size(1), :]
         t = t + p
-        t = self.dropout(t)
+        t = self.dropout(t)                 # FIXME: remove
         return t
 
 
