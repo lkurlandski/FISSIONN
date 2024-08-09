@@ -444,7 +444,14 @@ class RecurrentApproximator(nn.Module):
         return predictions
 
     def translate(self, inputs: Tensor) -> Tensor:
-        return self.forward(inputs, None, 0.0)
+        is_training = self.training
+        if is_training:
+            self.eval()
+        with torch.no_grad():
+            targets = self.forward(inputs, None, 0.0)
+        if is_training:
+            self.train()
+        return targets
 
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> RecurrentApproximator:
@@ -614,7 +621,14 @@ class TransformerApproximator(nn.Module):
         return predictions
 
     def translate(self, inputs: Tensor) -> Tensor:
-        return self.forward(inputs, None, 0.0)
+        is_training = self.training
+        if is_training:
+            self.eval()
+        with torch.no_grad():
+            targets = self.forward(inputs, None, 0.0)
+        if is_training:
+            self.train()
+        return targets
 
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> TransformerApproximator:
