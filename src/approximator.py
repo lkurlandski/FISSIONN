@@ -56,7 +56,7 @@ from pprint import pformat
 import random
 from statistics import mean
 import sys
-from typing import Callable, Generator, Literal, Optional, Self
+from typing import Callable, Generator, Literal, Optional, Protocol, Self
 import warnings
 
 import numpy as np
@@ -247,6 +247,33 @@ class ApproximatorLossFn(nn.Module):
         return self.loss_fn.forward(y_pred[mask], y_true[mask])
 
 
+class Approximator(Protocol):
+
+    def __init__(self) -> None:
+        ...
+
+    def embed(self, inputs: Tensor) -> Tensor:
+        ...
+
+    def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor] | Tensor:
+        ...
+
+    def decode(self, encoder_outputs: Tensor, targets: Optional[Tensor], *args, **kwds) -> Tensor:
+        ...
+
+    def project(output: Tensor) -> Tensor:
+        ...
+
+    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, *args, **kwds) -> Tensor:
+        ...
+
+    def translate(self, inputs: Tensor) -> Tensor:
+        ...
+
+    @classmethod
+    def from_pretrained(cls, file: os.PathLike, **kwds) -> Approximator:
+        return torch.load(file, **kwds)
+
 class Attention(nn.Module):
 
     def __init__(self, hidden_size: int) -> None:
@@ -418,6 +445,10 @@ class RecurrentApproximator(nn.Module):
 
     def translate(self, inputs: Tensor) -> Tensor:
         return self.forward(inputs, None, 0.0)
+
+    @classmethod
+    def from_pretrained(cls, file: os.PathLike, **kwds) -> RecurrentApproximator:
+        return torch.load(file, **kwds)
 
 
 class PositionalEncoding(nn.Module):
