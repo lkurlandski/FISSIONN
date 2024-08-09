@@ -243,8 +243,11 @@ class ApproximatorLossFn(nn.Module):
         # Mask out the special tokens. Since MSE takes the mean of the squared differences,
         # masking out the padding tokens will neither help nor hurt the overall loss (I think).
         mask = (y_true != PAD) & (y_true != BOS) & (y_pred != PAD) & (y_pred != BOS)
+        y_pred_masked = y_pred[mask]
+        y_true_masked = y_true[mask]
+        loss_masked = self.loss_fn.forward(y_pred_masked, y_true_masked)
 
-        return self.loss_fn.forward(y_pred[mask], y_true[mask])
+        return loss_masked
 
 
 class Approximator(Protocol):
@@ -273,6 +276,7 @@ class Approximator(Protocol):
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> Approximator:
         return torch.load(file, **kwds)
+
 
 class Attention(nn.Module):
 
@@ -473,7 +477,6 @@ class PositionalEncoding(nn.Module):
         embedding[:, 0::2] = torch.sin(pos * den)
         embedding[:, 1::2] = torch.cos(pos * den)
         embedding = embedding.unsqueeze(0)
-        self.dropout = nn.Dropout(dropout)  # FIXME: remove
         self.register_buffer("embedding", embedding)
 
     def forward(self, t: Tensor):
@@ -481,7 +484,6 @@ class PositionalEncoding(nn.Module):
             raise ShapeError((t.shape), ("B", "L", "H"))
         p = self.embedding[:, :t.size(1), :]
         t = t + p
-        t = self.dropout(t)                 # FIXME: remove
         return t
 
 
@@ -575,8 +577,9 @@ class TransformerApproximator(nn.Module):
 
         for i in range(1, self.max_length):
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(i, D, torch.bool)  # (i, i)
+            tgt_padding_mask = (decoder_input == PAD).to(D)
             decoder_embeddings = self.embed(decoder_input)                               # (B, i, H)
-            decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, tgt_is_causal=True)  # (B, i, H)
+            decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, None, tgt_padding_mask, tgt_is_causal=True)  # (B, i, H)
 
             prediction = self.project(decoder_output)  # (B, i)
             prediction = prediction[:, -1]             # (B,)
@@ -660,6 +663,9 @@ class ApproximatorTrainer(Trainer):
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
         y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
+
+        print(f"trn: {[round(i, 3) for i in y_pred[0].tolist()[0:8]]}")  # FIXME: remove
+
         return (y_pred,)
 
     def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
@@ -667,6 +673,10 @@ class ApproximatorTrainer(Trainer):
         y: Tensor = batch[1].to(self.args.device)
         y_pred_tch = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         y_pred_gen = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
+
+        print(f"tch: {[round(i, 3) for i in y_pred_tch[0].tolist()[0:8]]}")  # FIXME: remove
+        print(f"gen: {[round(i, 3) for i in y_pred_gen[0].tolist()[0:8]]}")  # FIXME: remove
+
         return (y_pred_tch, y_pred_gen)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
