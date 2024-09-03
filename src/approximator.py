@@ -223,9 +223,10 @@ class ApproximatorLossFn(nn.Module):
      - Is there a better way to handle mismatching sequence lengths?
     """
 
-    def __init__(self, allow_different_lengths: bool = False) -> None:
+    def __init__(self, allow_different_lengths: bool = False, ratio: float = 1.0) -> None:
         super().__init__()
         self.allow_different_lengths = allow_different_lengths
+        self.ratio = ratio
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
@@ -466,7 +467,7 @@ class PositionalEncoding(nn.Module):
 
     embedding: Tensor
 
-    def __init__(self, emb_size: int, max_length: int, dropout: float = 0.1) -> None:
+    def __init__(self, emb_size: int, max_length: int) -> None:
         if emb_size % 2 != 0:
             raise ValueError(f"The embedding size {emb_size=} must be divisible by 2.")
 
@@ -509,14 +510,15 @@ class TransformerApproximator(nn.Module):
         num_layers: int,
         nhead: int,
         intermediate_size: int,
+        dropout: float = 0.25,
     ) -> None:
         super().__init__()
         self.max_length = max_length
         self.embedding = nn.Linear(1, hidden_size)
         self.positional_encoding = PositionalEncoding(hidden_size, max_length)
-        self.dropout = nn.Dropout(0.1)
-        encoder_layer = nn.TransformerEncoderLayer(hidden_size, nhead, intermediate_size, batch_first=True)
-        decoder_layer = nn.TransformerDecoderLayer(hidden_size, nhead, intermediate_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        encoder_layer = nn.TransformerEncoderLayer(hidden_size, nhead, intermediate_size, dropout, batch_first=True)
+        decoder_layer = nn.TransformerDecoderLayer(hidden_size, nhead, intermediate_size, dropout, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
         self.head = nn.Linear(hidden_size, 1)
@@ -663,9 +665,6 @@ class ApproximatorTrainer(Trainer):
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
         y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
-
-        print(f"trn: {[round(i, 3) for i in y_pred[0].tolist()[0:8]]}")  # FIXME: remove
-
         return (y_pred,)
 
     def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
@@ -673,10 +672,6 @@ class ApproximatorTrainer(Trainer):
         y: Tensor = batch[1].to(self.args.device)
         y_pred_tch = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         y_pred_gen = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
-
-        print(f"tch: {[round(i, 3) for i in y_pred_tch[0].tolist()[0:8]]}")  # FIXME: remove
-        print(f"gen: {[round(i, 3) for i in y_pred_gen[0].tolist()[0:8]]}")  # FIXME: remove
-
         return (y_pred_tch, y_pred_gen)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
