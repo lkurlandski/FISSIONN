@@ -752,6 +752,7 @@ def main() -> None:
         args.teacher_ratio_start,
         args.teacher_ratio_end,
     )
+    print(f"{oh.path=}")
 
     seed_everything(args.seed)
 
