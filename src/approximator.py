@@ -308,7 +308,7 @@ class Approximator(Protocol):
 
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> Approximator:
-        return torch.load(file, **kwds)
+        ...
 
 
 class Attention(nn.Module):
@@ -450,7 +450,7 @@ class RecurrentApproximator(nn.Module):
             prediction = prediction[:, -1]             # (B,)
             predictions[:,i] = prediction              # (B, T)
 
-            if (finished := finished | (prediction == PAD)).all():
+            if (finished := finished | (prediction == EOS)).all():
                 break
 
             if not teacher_force_batch_mode:
@@ -646,7 +646,7 @@ class TransformerApproximator(nn.Module):
             prediction = prediction[:, -1]             # (B,)
             predictions[:, i] = prediction
 
-            if (finished := finished | (prediction == PAD)).all():
+            if (finished := finished | (prediction == EOS)).all():
                 break
 
             if not teacher_force_batch_mode:
