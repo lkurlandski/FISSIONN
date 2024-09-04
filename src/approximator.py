@@ -780,7 +780,7 @@ def main() -> None:
             ...
             # BACKEND = SDPBackend.MATH
     else:
-        config = {"max_length": args.max_length} | getattr(RecurrentApproximator, args.arch_config.upper())
+        config = {"max_length": args.max_length, "cell": args.arch} | getattr(RecurrentApproximator, args.arch_config.upper())
         model = RecurrentApproximator(**config)
 
     print(f"Model:\n{model}")
