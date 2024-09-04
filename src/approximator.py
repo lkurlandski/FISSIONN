@@ -480,9 +480,9 @@ class RecurrentApproximator(nn.Module):
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
     ) -> Tensor:
-        if targets is not None:
-            ApproximatorCollateFn.verify_has_bos(targets)
-            ApproximatorCollateFn.verify_has_eos(targets)
+        # if targets is not None:
+        #     ApproximatorCollateFn.verify_has_bos(targets)
+        #     ApproximatorCollateFn.verify_has_eos(targets)
 
         embeddings = self.embed_src(inputs)                        # (B, T, H)
         encoder_outputs, encoder_hidden = self.encode(embeddings)  # (B, T, H), (L, B, H)
@@ -673,9 +673,9 @@ class TransformerApproximator(nn.Module):
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
     ) -> Tensor:
-        if targets is not None:
-            ApproximatorCollateFn.verify_has_bos(targets)
-            ApproximatorCollateFn.verify_has_eos(targets)
+        # if targets is not None:
+        #     ApproximatorCollateFn.verify_has_bos(targets)
+        #     ApproximatorCollateFn.verify_has_eos(targets)
 
         src_mask = torch.zeros(
             (inputs.size(1), inputs.size(1)), dtype=torch.bool, device=inputs.device
@@ -754,12 +754,14 @@ class ApproximatorTrainer(Trainer):
         # _median = round(y_pred_tch[0].median().item(), ndigits)
         # _std    = round(y_pred_tch[0].std().item(), ndigits)
         # _vals   = [round(i.item(), ndigits) for i in y_pred_tch[0][0:nvalues]]
-        # print(f"y_pred_tch: {_mean=} {_median=} {_std=} {_vals=}")
+        # _tail   = [round(i.item(), ndigits) for i in y_pred_tch[0][-nvalues:]]
+        # print(f"y_pred_tch: {_mean=} {_median=} {_std=} {_vals=} {_tail=}")
         # _mean   = round(y_pred_gen[0].mean().item(), ndigits)
         # _median = round(y_pred_gen[0].median().item(), ndigits)
         # _std    = round(y_pred_gen[0].std().item(), ndigits)
         # _vals   = [round(i.item(), ndigits) for i in y_pred_gen[0][0:nvalues]]
-        # print(f"y_pred_gen: {_mean=} {_median=} {_std=} {_vals=}")
+        # _tail   = [round(i.item(), ndigits) for i in y_pred_tch[0][-nvalues:]]
+        # print(f"y_pred_gen: {_mean=} {_median=} {_std=} {_vals=} {_tail=}")
 
         loss_tch = self.loss_fn.forward(y_pred_tch, y)
         loss_gen = self.loss_fn.forward(y_pred_gen, y)
