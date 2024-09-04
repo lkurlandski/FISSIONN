@@ -685,6 +685,20 @@ class ApproximatorTrainer(Trainer):
         y = y[:, 1:]
         y_pred_tch: Tensor = outputs[0]
         y_pred_gen: Tensor = outputs[1]
+
+        # ndigits = 4
+        # nvalues = 8
+        # _mean   = round(y_pred_tch[0].mean().item(), ndigits)
+        # _median = round(y_pred_tch[0].median().item(), ndigits)
+        # _std    = round(y_pred_tch[0].std().item(), ndigits)
+        # _vals   = [round(i.item(), ndigits) for i in y_pred_tch[0][0:nvalues]]
+        # print(f"y_pred_tch: {_mean=} {_median=} {_std=} {_vals=}")
+        # _mean   = round(y_pred_gen[0].mean().item(), ndigits)
+        # _median = round(y_pred_gen[0].median().item(), ndigits)
+        # _std    = round(y_pred_gen[0].std().item(), ndigits)
+        # _vals   = [round(i.item(), ndigits) for i in y_pred_gen[0][0:nvalues]]
+        # print(f"y_pred_gen: {_mean=} {_median=} {_std=} {_vals=}")
+
         loss_tch = self.loss_fn.forward(y_pred_tch, y)
         loss_gen = self.loss_fn.forward(y_pred_gen, y)
         return {"loss_tch": loss_tch.item(), "loss_gen": loss_gen.item()}
