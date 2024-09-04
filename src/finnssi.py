@@ -26,6 +26,7 @@ from torch import nn, Tensor
 from torch.distributions import Laplace, Uniform
 from torch.nn import functional as F, CrossEntropyLoss, L1Loss
 from torch.optim import Optimizer, Adam
+from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
@@ -148,11 +149,11 @@ class FinnSSIModel(nn.Module):
 
     def forward(self, fingerprint: Tensor, ipd: Tensor) -> tuple[Tensor, Tensor]:
         # Feed the fingerprint and the ipd to the encoder to get the delays
-        encoder_input = torch.cat((fingerprint, ipd), dim=1)
-        delays = self.encoder.forward(encoder_input)
-        noisy_ipd = self.get_noisy_ipd(ipd, delays)
-        marked_ipd = noisy_ipd + torch.cumsum(delays, dim=1)
-        fingerprint = self.decoder.forward(marked_ipd)
+        encoder_input = torch.cat((fingerprint, ipd), dim=1)  # requires_grad == False
+        delays = self.encoder.forward(encoder_input)          # requires_grad == True
+        noisy_ipd = self.get_noisy_ipd(ipd, delays)           # requires_grad == False
+        marked_ipd = noisy_ipd + torch.cumsum(delays, dim=1)  # requires_grad == True
+        fingerprint = self.decoder.forward(marked_ipd)        # requires_grad == True
         return delays, fingerprint
 
     def get_noisy_ipd(self, ipd: Tensor, delays: Tensor) -> Tensor:
@@ -172,8 +173,8 @@ class FinnTrainer(Trainer):
     loss_fn: FinnLossFn
     tr_metric_keys = ("tr_loss", "tr_enc_loss", "tr_dec_loss", "tr_time",)
 
-    def create_scheduler(self) -> None:
-        return None
+    # def create_scheduler(self) -> Optional[LRScheduler]:
+    #     return ExponentialLR(self.optimizer, gamma=0.995)
 
     def create_stopper(self) -> None:
         return None
