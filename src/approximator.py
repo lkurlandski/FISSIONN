@@ -91,6 +91,7 @@ BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
 PAD = -10000.0
 BOS = -10001.0
+EOS = -10002.0
 
 
 def pad(shape: tuple[int]) -> Tensor:
@@ -99,6 +100,10 @@ def pad(shape: tuple[int]) -> Tensor:
 
 def bos(shape: tuple[int]) -> Tensor:
     return torch.full(shape, BOS)
+
+
+def eos(shape: tuple[int]) -> Tensor:
+    return torch.full(shape, EOS)
 
 
 class ApproximatorDataset(Dataset):
@@ -204,16 +209,40 @@ class ApproximatorCollateFn:
 
     def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
         b = bos((1,))
+        e = eos((1,))
         x = []
         y = []
         for x_, y_ in batch:
-            x_ = x_[0 : self.max_length - 1]
-            y_ = y_[0 : self.max_length - 1]
-            x.append(torch.cat([b, x_]))
-            y.append(torch.cat([b, y_]))
+            x_ = x_[0 : self.max_length - 2]
+            y_ = y_[0 : self.max_length - 2]
+            x.append(self.add_special_tokens(x_))
+            y.append(self.add_special_tokens(y_))
         x = pad_sequence(x, batch_first=True, padding_value=PAD)
         y = pad_sequence(y, batch_first=True, padding_value=PAD)
         return x, y
+
+    @staticmethod
+    def add_special_tokens(z: Tensor) -> Tensor:
+        if z.dim() == 1:
+            shape = (1,)
+            dim = 0
+        elif z.dim() == 2:
+            shape = (z.size(0), 1)
+            dim = 1
+        else:
+            raise ShapeError(z.shape, ("{B}", "T"))
+        return torch.cat([bos(shape), z, eos(shape)], dim=dim)
+
+    @staticmethod
+    def verify_has_bos(z: Tensor):
+        if not torch.all(z[:, 0] == BOS):
+            raise ValueError(f"Sequences do not begin with {BOS=}")
+
+    @staticmethod
+    def verify_has_eos(z: Tensor):
+        eos_positions = (z == EOS).nonzero(as_tuple=False)
+        if eos_positions.shape[0] != z.size(0):
+            raise ValueError(f"Sequences do not end with {EOS=}")
 
 
 class ApproximatorLossFn(nn.Module):
@@ -243,7 +272,7 @@ class ApproximatorLossFn(nn.Module):
 
         # Mask out the special tokens. Since MSE takes the mean of the squared differences,
         # masking out the padding tokens will neither help nor hurt the overall loss (I think).
-        mask = (y_true != PAD) & (y_true != BOS) & (y_pred != PAD) & (y_pred != BOS)
+        mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS) & (y_pred != PAD) & (y_pred != BOS) & (y_pred != EOS)
         y_pred_masked = y_pred[mask]
         y_true_masked = y_true[mask]
         loss_masked = self.loss_fn.forward(y_pred_masked, y_true_masked)
@@ -256,7 +285,10 @@ class Approximator(Protocol):
     def __init__(self) -> None:
         ...
 
-    def embed(self, inputs: Tensor) -> Tensor:
+    def embed_src(self, inputs: Tensor) -> Tensor:
+        ...
+
+    def embed_tgt(self, targets: Tensor) -> Tensor:
         ...
 
     def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor] | Tensor:
@@ -327,7 +359,8 @@ class RecurrentApproximator(nn.Module):
         super().__init__()
         self.max_length = max_length
         cell = RecurrentApproximator.CELL[cell]
-        self.embedding = nn.Linear(1, hidden_size)
+        self.embedding_src = nn.Linear(1, hidden_size)
+        self.embedding_tgt = nn.Linear(1, hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.attention = Attention(hidden_size)
         self.encoder: nn.RNN | nn.LSTM | nn.GRU = cell(
@@ -346,11 +379,21 @@ class RecurrentApproximator(nn.Module):
         )
         self.head = nn.Linear(hidden_size, 1)
 
-    def embed(self, inputs: Tensor) -> Tensor:
+    def embed_src(self, inputs: Tensor) -> Tensor:
         if inputs.dim() != 2:
             raise ShapeError((inputs.shape), ("B", "T"))
+        ApproximatorCollateFn.verify_has_bos(inputs)
+        ApproximatorCollateFn.verify_has_eos(inputs)
         x = inputs.unsqueeze(2)
-        x = self.embedding.forward(x)
+        x = self.embedding_src.forward(x)
+        x = self.dropout.forward(x)
+        return x
+
+    def embed_tgt(self, targets: Tensor) -> Tensor:
+        if targets.dim() != 2:
+            raise ShapeError((targets.shape), ("B", "T"))
+        x = targets.unsqueeze(2)
+        x = self.embedding_tgt.forward(x)
         x = self.dropout.forward(x)
         return x
 
@@ -396,7 +439,7 @@ class RecurrentApproximator(nn.Module):
         finished = torch.zeros((B,), dtype=torch.bool, device=D)
         for i in range(1, self.max_length):
 
-            embeddings = self.embed(decoder_input)                        # (B, 1, H)
+            embeddings = self.embed_tgt(decoder_input)                    # (B, 1, H)
             final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
 
             context, _ = self.attention.forward(final_hidden_state, encoder_outputs)                   # (B, 1, H), (B, 1, 2 * H)
@@ -437,7 +480,11 @@ class RecurrentApproximator(nn.Module):
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
     ) -> Tensor:
-        embeddings = self.embed(inputs)                            # (B, T, H)
+        if targets is not None:
+            ApproximatorCollateFn.verify_has_bos(targets)
+            ApproximatorCollateFn.verify_has_eos(targets)
+
+        embeddings = self.embed_src(inputs)                        # (B, T, H)
         encoder_outputs, encoder_hidden = self.encode(embeddings)  # (B, T, H), (L, B, H)
         predictions = self.decode(
             encoder_outputs,
@@ -514,7 +561,8 @@ class TransformerApproximator(nn.Module):
     ) -> None:
         super().__init__()
         self.max_length = max_length
-        self.embedding = nn.Linear(1, hidden_size)
+        self.embedding_src = nn.Linear(1, hidden_size)
+        self.embedding_tgt = nn.Linear(1, hidden_size)
         self.positional_encoding = PositionalEncoding(hidden_size, max_length)
         self.dropout = nn.Dropout(dropout)
         encoder_layer = nn.TransformerEncoderLayer(hidden_size, nhead, intermediate_size, dropout, batch_first=True)
@@ -523,11 +571,22 @@ class TransformerApproximator(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
         self.head = nn.Linear(hidden_size, 1)
 
-    def embed(self, inputs: Tensor) -> Tensor:
+    def embed_src(self, inputs: Tensor) -> Tensor:
         if inputs.dim() != 2:
             raise ShapeError((inputs.shape), ("B", "T"))
+        ApproximatorCollateFn.verify_has_bos(inputs)
+        ApproximatorCollateFn.verify_has_eos(inputs)
         x = inputs.unsqueeze(2)
-        x = self.embedding.forward(x)
+        x = self.embedding_src.forward(x)
+        x = self.positional_encoding.forward(x)
+        x = self.dropout.forward(x)
+        return x
+
+    def embed_tgt(self, targets: Tensor) -> Tensor:
+        if targets.dim() != 2:
+            raise ShapeError((targets.shape), ("B", "T"))
+        x = targets.unsqueeze(2)
+        x = self.embedding_tgt.forward(x)
         x = self.positional_encoding.forward(x)
         x = self.dropout.forward(x)
         return x
@@ -567,8 +626,8 @@ class TransformerApproximator(nn.Module):
 
         if use_teacher_forcing:
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(T_tgt, device=D, dtype=bool)
-            tgt_padding_mask = (targets == PAD).to(D)  # (B, T)
-            decoder_embeddings = self.embed(targets)   # (B, T, H)
+            tgt_padding_mask = (targets == PAD).to(D)     # (B, T)
+            decoder_embeddings = self.embed_tgt(targets)  # (B, T, H)
             decoder_outputs = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, None, tgt_padding_mask, tgt_is_causal=True)
             predictions = self.project(decoder_outputs)
             return predictions
@@ -580,7 +639,7 @@ class TransformerApproximator(nn.Module):
         for i in range(1, self.max_length):
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(i, D, torch.bool)  # (i, i)
             tgt_padding_mask = (decoder_input == PAD).to(D)
-            decoder_embeddings = self.embed(decoder_input)                               # (B, i, H)
+            decoder_embeddings = self.embed_tgt(decoder_input)                           # (B, i, H)
             decoder_output = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, None, tgt_padding_mask, tgt_is_causal=True)  # (B, i, H)
 
             prediction = self.project(decoder_output)  # (B, i)
@@ -614,13 +673,16 @@ class TransformerApproximator(nn.Module):
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
     ) -> Tensor:
+        if targets is not None:
+            ApproximatorCollateFn.verify_has_bos(targets)
+            ApproximatorCollateFn.verify_has_eos(targets)
 
         src_mask = torch.zeros(
             (inputs.size(1), inputs.size(1)), dtype=torch.bool, device=inputs.device
         )
         src_padding_mask = (inputs == PAD).to(inputs.device)
 
-        embeddings = self.embed(inputs)
+        embeddings = self.embed_src(inputs)
         encoder_outputs = self.encode(embeddings, src_mask, src_padding_mask)
         predictions = self.decode(encoder_outputs, targets, teacher_force_ratio, teacher_force_batch_mode)
         return predictions

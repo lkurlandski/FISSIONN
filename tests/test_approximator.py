@@ -9,6 +9,9 @@ from torch.nn.utils.rnn import pad_sequence
 
 from src.approximator import *
 
+import unittest
+import torch
+
 
 class TestApproximators(unittest.TestCase):
 
@@ -37,26 +40,40 @@ class TestApproximators(unittest.TestCase):
             intermediate_size=self.intermediate_size,
         )
 
-        self.inputs = torch.rand(self.batch_size, self.input_length)
-        self.targets = torch.rand(self.batch_size, self.target_length)
+        self.inputs = ApproximatorCollateFn.add_special_tokens(torch.rand(self.batch_size, self.input_length - 2))
+        self.targets = ApproximatorCollateFn.add_special_tokens(torch.rand(self.batch_size, self.target_length - 2))
         self.embeddings = torch.rand(self.batch_size, self.input_length, self.hidden_size)
         self.encoder_outputs = torch.rand(self.batch_size, self.input_length, self.hidden_size)
         self.encoder_hidden = torch.rand(self.num_layers, self.batch_size, self.hidden_size)
         self.decoder_outputs = torch.rand(self.batch_size, self.target_length, self.hidden_size)
 
-    def _test_embed(self, embeddings: Tensor):
+    def _test_embed_src(self, embeddings: Tensor):
         assert embeddings.dim() == 3
-        assert embeddings.size(0) == self.batch_size
-        assert embeddings.size(1) == self.input_length
-        assert embeddings.size(2) == self.hidden_size
+        assert embeddings.size(0) == self.batch_size, f"Got shape={tuple(embeddings.shape)}. Expected shape={(self.batch_size, self.input_length, self.hidden_size)}."
+        assert embeddings.size(1) == self.input_length, f"Got shape={tuple(embeddings.shape)}. Expected shape={(self.batch_size, self.input_length, self.hidden_size)}."
+        assert embeddings.size(2) == self.hidden_size, f"Got shape={tuple(embeddings.shape)}. Expected shape={(self.batch_size, self.input_length, self.hidden_size)}."
 
-    def test_embed_rec(self):
-        embeddings = self.rec.embed(self.inputs)
-        self._test_embed(embeddings)
+    def test_embed_src_rec(self):
+        embeddings = self.rec.embed_src(self.inputs)
+        self._test_embed_src(embeddings)
 
-    def test_embed_trn(self):
-        embeddings = self.trn.embed(self.inputs)
-        self._test_embed(embeddings)
+    def test_embed_src_trn(self):
+        embeddings = self.trn.embed_src(self.inputs)
+        self._test_embed_src(embeddings)
+
+    def _test_embed_tgt(self, embeddings: Tensor):
+        assert embeddings.dim() == 3
+        assert embeddings.size(0) == self.batch_size, f"Got shape={tuple(embeddings.shape)}. Expected shape={(self.batch_size, self.target_length, self.hidden_size)}."
+        assert embeddings.size(1) == self.target_length, f"Got shape={tuple(embeddings.shape)}. Expected shape={(self.batch_size, self.target_length, self.hidden_size)}."
+        assert embeddings.size(2) == self.hidden_size, f"Got shape={tuple(embeddings.shape)}. Expected shape={(self.batch_size, self.target_length, self.hidden_size)}."
+
+    def test_embed_tgt_rec(self):
+        embeddings = self.rec.embed_tgt(self.targets)
+        self._test_embed_tgt(embeddings)
+
+    def test_embed_tgt_trn(self):
+        embeddings = self.trn.embed_tgt(self.targets)
+        self._test_embed_tgt(embeddings)
 
     def _test_encoder_outputs(self, outputs: Tensor, hidden: Tensor):
         assert outputs.dim() == 3
