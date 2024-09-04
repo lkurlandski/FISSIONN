@@ -76,6 +76,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_data
+from src.metrics import normalized_deviation,normalized_root_mean_squared_error
 from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser, TeacherRatioScheduler, EarlyStopper
 from src.utils import (
     count_parameters,
@@ -252,32 +253,47 @@ class ApproximatorLossFn(nn.Module):
      - Is there a better way to handle mismatching sequence lengths?
     """
 
-    def __init__(self, allow_different_lengths: bool = False, ratio: float = 1.0) -> None:
+    def __init__(self, allow_different_lengths: bool = False) -> None:
         super().__init__()
         self.allow_different_lengths = allow_different_lengths
-        self.ratio = ratio
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
-        # If the lengths are different, pad/truncate y_pred to the length of y_true
+        y_pred_masked, y_true_masked = ApproximatorLossFn.prepare_inputs_and_targets(
+            y_pred, y_true, self.allow_different_lengths
+        )
+        loss_masked = self.loss_fn.forward(y_pred_masked, y_true_masked)
+
+        return loss_masked
+
+    @staticmethod
+    def prepare_inputs_and_targets(
+        y_pred: Tensor,
+        y_true: Tensor,
+        allow_different_lengths: bool = False,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Note that this will flatten 2-dimension inputs.
+        """
+
+        # If the lengths are different, pad/truncate y_pred to the length of y_true.
         if y_pred.size(1) != y_true.size(1):
-            if not self.allow_different_lengths:
+            if not allow_different_lengths:
                 raise ShapeError((y_pred.shape, y_true.shape), (("B", "T"), ("B", "T")))
             y_pred = y_pred[:, :y_true.size(1)]
             padding = pad((y_pred.size(0), y_true.size(1) - y_pred.size(1))).to(y_pred.device)
             y_pred = torch.cat([y_pred, padding], dim=1)
 
         # Mask out the special tokens. Since MSE takes the mean of the squared differences,
-        # masking out the padding tokens will neither help nor hurt the overall loss (I think).
+        # masking out the padding tokens will neither help nor hurt the metrics (I think.)
         mask = (y_true != PAD) & (y_true != BOS) & (y_true != EOS) & (y_pred != PAD) & (y_pred != BOS) & (y_pred != EOS)
         y_pred_masked = y_pred[mask]
         y_true_masked = y_true[mask]
-        loss_masked = self.loss_fn.forward(y_pred_masked, y_true_masked)
 
-        return loss_masked
+        return y_pred_masked, y_true_masked
 
 
 class Approximator(Protocol):
@@ -749,23 +765,40 @@ class ApproximatorTrainer(Trainer):
         y_pred_gen: Tensor = outputs[1]
 
         # ndigits = 4
-        # nvalues = 8
+        # nvalues = 4
         # _mean   = round(y_pred_tch[0].mean().item(), ndigits)
         # _median = round(y_pred_tch[0].median().item(), ndigits)
         # _std    = round(y_pred_tch[0].std().item(), ndigits)
-        # _vals   = [round(i.item(), ndigits) for i in y_pred_tch[0][0:nvalues]]
+        # _head   = [round(i.item(), ndigits) for i in y_pred_tch[0][0:nvalues]]
         # _tail   = [round(i.item(), ndigits) for i in y_pred_tch[0][-nvalues:]]
-        # print(f"y_pred_tch: {_mean=} {_median=} {_std=} {_vals=} {_tail=}")
+        # print(f"y_pred_tch: {_mean=} {_median=} {_std=} {_head=} {_tail=}")
         # _mean   = round(y_pred_gen[0].mean().item(), ndigits)
         # _median = round(y_pred_gen[0].median().item(), ndigits)
         # _std    = round(y_pred_gen[0].std().item(), ndigits)
-        # _vals   = [round(i.item(), ndigits) for i in y_pred_gen[0][0:nvalues]]
+        # _head   = [round(i.item(), ndigits) for i in y_pred_gen[0][0:nvalues]]
         # _tail   = [round(i.item(), ndigits) for i in y_pred_tch[0][-nvalues:]]
-        # print(f"y_pred_gen: {_mean=} {_median=} {_std=} {_vals=} {_tail=}")
+        # print(f"y_pred_gen: {_mean=} {_median=} {_std=} {_head=} {_tail=}")
 
         loss_tch = self.loss_fn.forward(y_pred_tch, y)
         loss_gen = self.loss_fn.forward(y_pred_gen, y)
-        return {"loss_tch": loss_tch.item(), "loss_gen": loss_gen.item()}
+
+        y_pred_tch_masked, y_true_tch_masked = ApproximatorLossFn.prepare_inputs_and_targets(y_pred_tch, y, True)
+        y_pred_gen_masked, y_true_gen_masked = ApproximatorLossFn.prepare_inputs_and_targets(y_pred_gen, y, True)
+
+        nrmse_tch = normalized_root_mean_squared_error(y_pred_tch_masked, y_true_tch_masked)
+        nrmse_gen = normalized_root_mean_squared_error(y_pred_gen_masked, y_true_gen_masked)
+
+        nd_tch = normalized_deviation(y_pred_tch_masked, y_true_tch_masked)
+        nd_gen = normalized_deviation(y_pred_gen_masked, y_true_gen_masked)
+
+        return {
+            "loss_tch": loss_tch.item(),
+            "loss_gen": loss_gen.item(),
+            "nrmse_tch": nrmse_tch.item(),
+            "nrmse_gen": nrmse_gen.item(),
+            "nd_tch": nd_tch.item(),
+            "nd_gen": nd_gen.item(),
+        }
 
 
 class OutputHelper:
