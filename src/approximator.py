@@ -67,7 +67,7 @@ from torch import nn, Tensor, BoolTensor
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import ExponentialLR, LRScheduler
+from torch.optim.lr_scheduler import ExponentialLR, LRScheduler, SequentialLR, ConstantLR, LinearLR
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
@@ -731,7 +731,10 @@ class ApproximatorTrainer(Trainer):
             return super().__call__()
 
     def create_scheduler(self) -> Optional[LRScheduler]:
-        return ExponentialLR(self.optimizer, gamma=0.75)
+        warmup_scheduler = LinearLR(self.optimizer, start_factor=0.01, total_iters=10)
+        decay_scheduler = ExponentialLR(self.optimizer, gamma=0.85)
+        scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[10])
+        return scheduler
 
     def create_stopper(self) -> None:
         return None
