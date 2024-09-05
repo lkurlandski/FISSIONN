@@ -191,7 +191,8 @@ class ApproximatorDataset(Dataset):
 
     @staticmethod
     def get_synthetic_hops(ipds: list[np.ndarray], num_tries: int = 1, n_processes: Optional[int] = None) -> list[np.ndarray]:
-        n_processes = len(os.sched_getaffinity()) // 2 if n_processes is None else n_processes
+        if n_processes is None or n_processes < 2:
+            return [ApproximatorDataset.get_synthetic_hop(ipd, num_tries) for ipd in ipds]
         with mp.Pool(n_processes) as pool:
             return pool.starmap(ApproximatorDataset.get_synthetic_hop, zip(ipds, [num_tries] * len(ipds)))
 
