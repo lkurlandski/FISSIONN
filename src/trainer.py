@@ -209,7 +209,7 @@ class Trainer(ABC):
                 if isinstance(self.scheduler, ReduceLROnPlateau):
                     self.scheduler.step(metrics=vl_metrics[self.args.metric], epoch=None)
                 else:
-                    self.scheduler.step(epoch=None)
+                    self.scheduler.step()
             if self.stopper is not None:
                 self.stopper.step(vl_metrics[self.args.metric])
                 if self.stopper.stop:
@@ -322,6 +322,9 @@ class Trainer(ABC):
         for k, v in results.items():
             results[k] = mean(v)
         results["tr_time"] = time.time() - t_0
+
+        # If all we got was NaN's for Inf's, add to the dict and let the caller handle.
+        results["tr_loss"] = results.get("tr_loss", float("nan"))
 
         return dict(results)
 
