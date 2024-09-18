@@ -762,6 +762,8 @@ class ApproximatorTrainer(Trainer):
         loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
         return loss, {}
 
+    # FIXME: compute metrics needs to operate on an entire list of items or else the
+    # seq2seq metrics will not be accurate.
     def compute_metrics(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Tensor]) -> dict[str, float]:
         y: Tensor = batch[1].to(self.args.device)
         y = y[:, 1:]
