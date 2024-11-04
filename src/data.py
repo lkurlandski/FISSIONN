@@ -1,10 +1,16 @@
 """
 
 """
-
+from collections import namedtuple
+from dataclasses import dataclass
 import pickle
 import numpy as np
-from typing import Generator
+from typing import Generator, Optional, TypeAlias
+
+import numpy as np
+
+
+FILE = "/home/lk3591/Documents/code/TrafficAnal/data/synthetic.pickle"
 
 
 def process(x: tuple) -> np.ndarray:
@@ -67,3 +73,71 @@ def stream_synthetic_data() -> Generator[np.ndarray, None, None]:
     for group in all_streams:
         for stream in group:
             yield stream
+
+
+StreamSlice = namedtuple("StreamSlice", ["timestamp", "packet_size", "direction", "ipd"])
+
+
+@dataclass
+class Stream:
+    timestamps: np.ndarray
+    packet_sizes: np.ndarray
+    directions: np.ndarray
+    ipds: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
+        if self.ipds is None:
+            self.ipds = np.concatenate(([0], np.diff(self.timestamps)))
+
+    def __iter__(self):
+        for t, p, d, i in zip(self.timestamps, self.packet_sizes, self.directions, self.ipds):
+            yield StreamSlice(t, p, d, i)
+
+    def __len__(self):
+        lengths = [len(self.timestamps), len(self.packet_sizes), len(self.directions), len(self.ipds)]
+        if len(set(lengths)) != 1:
+            raise ValueError("All arrays must have the same length.")
+        return lengths[0]
+
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        return (
+            f"Stream(\n"
+            f"    timestamps={self.timestamps[0:8].round(4).tolist()}...,\n"
+            f"    packet_sizes={self.packet_sizes[0:8].round(4).tolist()}...,\n"
+            f"    directions={self.directions[0:8].round(4).tolist()}...,\n"
+            f"    ipds={self.ipds[0:8].round(4).tolist()}...,\n"
+            ")\n"
+            f"{len(self)=}"
+        )
+
+
+Chain: TypeAlias = list[Stream]
+
+
+def extract_data(reorder: bool = True) -> list[Chain]:
+    """
+    Extract and organize the data from the pickle file in a coherent manner.
+    """
+    with open(FILE, "rb") as fp:
+        data: dict[str, dict[int, dict[int, list[np.ndarray]]]] = pickle.load(fp)["data"]
+
+    chains = []
+    for sample in data.values():
+        correlated_streams = []
+        for host in sample.values():
+            streams = []
+            for x in host:
+                timestamps, packet_sizes, directions = x
+                if reorder:
+                    idx = np.argsort(timestamps)
+                    timestamps = timestamps[idx]
+                    packet_sizes = packet_sizes[idx]
+                    directions = directions[idx]
+                streams.append(Stream(timestamps, packet_sizes, directions))
+            correlated_streams.extend(streams)
+        chains.append(correlated_streams)
+
+    return chains
