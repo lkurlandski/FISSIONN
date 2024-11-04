@@ -98,7 +98,9 @@ class TestApproximators(unittest.TestCase):
     def _test_decode(self, predictions: Tensor):
         assert predictions.dim() == 2
         assert predictions.size(0) == self.batch_size
-        assert predictions.size(1) in (self.max_length - 1, self.target_length), f"Got {tuple(predictions.shape)}. Expected ({self.batch_size}, {self.max_length - 1}) or ({self.batch_size}, {self.target_length})."
+        assert predictions.size(1) in (self.max_length, self.target_length), f"Got {tuple(predictions.shape)}. Expected ({self.batch_size}, {self.max_length}) or ({self.batch_size}, {self.target_length})."
+        assert torch.all(predictions[:,0] == BOS), f"Got {predictions[:,0]}. Expected {BOS}."
+        assert torch.all((predictions[:,-1] == EOS) | (predictions[:,-1] == PAD)), f"Got {predictions[:,-1]}. Expected {EOS} or {PAD}."
 
     def test_decode_rec_1(self):
         predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, 1.0)[0]

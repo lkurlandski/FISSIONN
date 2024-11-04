@@ -147,55 +147,6 @@ class ApproximatorDataset(Dataset):
         for group in ipd_groups:
             yield group[0], group[-1]
 
-    @staticmethod
-    def get_synthetic_sample() -> np.ndarray:
-        loc = abs(stats.laplace.rvs(loc=0, scale=2.19e-2))
-        scale = abs(stats.laplace.rvs(loc=0, scale=1.03e-1))
-        length = abs(stats.laplace.rvs(loc=0, scale=575))
-        ipds = stats.laplace.rvs(loc=loc, scale=scale, size=int(length))
-        ipds = np.absolute(ipds)
-        return ipds
-
-    @staticmethod
-    def get_synthetic_samples(n_samples: int, n_processes: Optional[int] = None) -> list[np.ndarray]:
-        n_processes = len(os.sched_getaffinity()) // 2 if n_processes is None else n_processes
-        with mp.Pool(n_processes) as pool:
-            return pool.map(ApproximatorDataset.get_synthetic_sample, range(n_samples))
-
-    @staticmethod
-    def get_synthetic_hop(ipds: np.ndarray, num_tries: int = 1) -> np.ndarray:
-        if num_tries < 1:
-            raise ValueError(f"{num_tries=}")
-
-        org_scale = stats.laplace.fit(ipds)[1]
-        for _ in range(num_tries):
-            delta_scale = stats.laplace.rvs(loc=8.09e-3, scale=2.61e-2)
-            new_scale = org_scale + delta_scale
-            if new_scale > 0:
-                break
-        else:
-            new_scale = org_scale
-
-        org_length = len(ipds)
-        for _ in range(num_tries):
-            delta_length = stats.laplace.rvs(loc=-2.00, scale=298)
-            new_length = math.ceil(org_length + delta_length)
-            if new_length > 0:
-                break
-        else:
-            new_length = org_length
-
-        ipds = stats.laplace.rvs(loc=0.0, scale=new_scale, size=new_length)
-        ipds = np.absolute(ipds)
-        return ipds
-
-    @staticmethod
-    def get_synthetic_hops(ipds: list[np.ndarray], num_tries: int = 1, n_processes: Optional[int] = None) -> list[np.ndarray]:
-        if n_processes is None or n_processes < 2:
-            return [ApproximatorDataset.get_synthetic_hop(ipd, num_tries) for ipd in ipds]
-        with mp.Pool(n_processes) as pool:
-            return pool.starmap(ApproximatorDataset.get_synthetic_hop, zip(ipds, [num_tries] * len(ipds)))
-
 
 BUILDER_PAIR_MODES: dict[str, Callable[[list[list[list[float]]]], Generator[tuple[list[float], list[float]]]]] = {
     "single_hops": ApproximatorDataset.build_pairs_from_single_hops,
@@ -248,27 +199,35 @@ class ApproximatorCollateFn:
 
 
 class ApproximatorLossFn(nn.Module):
-    """
-    TODO:
-     - Is there a better way to handle mismatching special tokens?
-     - Is there a better way to handle mismatching sequence lengths?
-    """
 
-    def __init__(self, allow_different_lengths: bool = False) -> None:
+    def __init__(self, timing_weight: float = 1.0, length_weight: float = 1.0) -> None:
         super().__init__()
-        self.allow_different_lengths = allow_different_lengths
+        self.timing_weight = timing_weight
+        self.length_weight = length_weight
         self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
-        y_pred_masked, y_true_masked = ApproximatorLossFn.prepare_inputs_and_targets(
-            y_pred, y_true, self.allow_different_lengths
-        )
-        loss_masked = self.loss_fn.forward(y_pred_masked, y_true_masked)
+        B = y_pred.size(0)
 
-        return loss_masked
+        # Determine the length of the predicted and target sequences, then compute the length loss.
+        def get_length(y: Tensor):
+            return (y == EOS).nonzero(as_tuple=False).max().item()
+
+        lengths = [(get_length(y_pred[i]), get_length(y_true[i])) for i in range(B)]
+        lengths = torch.tensor(lengths, device=y_pred.device)
+        loss_lengths = F.mse_loss(lengths[:, 0], lengths[:, 1])
+
+        # Consider only the tokens up to the length of the shortest sequence, then compute the timing loss.   
+        y_pred = pad_sequence([y_pred[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
+        y_true = pad_sequence([y_true[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD) 
+        loss_timings = F.mse_loss(y_pred, y_true)
+
+        # Combine the timing and length losses.
+        loss = self.timing_weight * loss_timings + self.length_weight * loss_lengths
+        return loss
 
     @staticmethod
     def prepare_inputs_and_targets(
@@ -481,7 +440,8 @@ class RecurrentApproximator(nn.Module):
             else:
                 decoder_input = prediction.unsqueeze(1)
 
-        return predictions[:, 1:], decoder_hidden
+        predictions[~finished, -1] = EOS
+        return predictions, decoder_hidden
 
     def project(self, output: Tensor) -> Tensor:
         if output.dim() != 3:
@@ -642,11 +602,16 @@ class TransformerApproximator(nn.Module):
             use_teacher_forcing = False
 
         if use_teacher_forcing:
+            targets = targets[:, :-1]
+            T_tgt = targets.size(1)
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(T_tgt, device=D, dtype=bool)
             tgt_padding_mask = (targets == PAD).to(D)     # (B, T)
             decoder_embeddings = self.embed_tgt(targets)  # (B, T, H)
             decoder_outputs = self.decoder.forward(decoder_embeddings, encoder_outputs, tgt_mask, None, tgt_padding_mask, tgt_is_causal=True)
             predictions = self.project(decoder_outputs)
+            finished = (predictions == EOS).any(dim=1)
+            predictions[~finished, -1] = EOS
+            predictions = torch.cat([bos((B, 1)), predictions], dim=1)
             return predictions
 
         predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)  # (B, T_max)
@@ -674,7 +639,8 @@ class TransformerApproximator(nn.Module):
             else:
                 decoder_input = predictions[:, :i + 1]
 
-        return predictions[:, 1:]
+        predictions[~finished, -1] = EOS
+        return predictions
 
     def project(self, output: Tensor) -> Tensor:
         if output.dim() != 3:
