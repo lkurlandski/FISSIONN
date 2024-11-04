@@ -161,8 +161,6 @@ class ApproximatorCollateFn:
         self.max_length = max_length
 
     def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
-        b = bos((1,))
-        e = eos((1,))
         x = []
         y = []
         for x_, y_ in batch:
@@ -218,11 +216,11 @@ class ApproximatorLossFn(nn.Module):
 
         lengths = [(get_length(y_pred[i]), get_length(y_true[i])) for i in range(B)]
         lengths = torch.tensor(lengths, device=y_pred.device)
-        loss_lengths = F.mse_loss(lengths[:, 0], lengths[:, 1])
+        loss_lengths = F.mse_loss(lengths[:, 0].to(torch.float32), lengths[:, 1].to(torch.float32))
 
-        # Consider only the tokens up to the length of the shortest sequence, then compute the timing loss.   
+        # Consider only the tokens up to the length of the shortest sequence, then compute the timing loss.
         y_pred = pad_sequence([y_pred[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
-        y_true = pad_sequence([y_true[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD) 
+        y_true = pad_sequence([y_true[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
         loss_timings = F.mse_loss(y_pred, y_true)
 
         # Combine the timing and length losses.
@@ -273,7 +271,7 @@ class Approximator(Protocol):
     def decode(self, encoder_outputs: Tensor, targets: Optional[Tensor], *args, **kwds) -> Tensor:
         ...
 
-    def project(output: Tensor) -> Tensor:
+    def project(self, output: Tensor) -> Tensor:
         ...
 
     def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, *args, **kwds) -> Tensor:
@@ -611,7 +609,7 @@ class TransformerApproximator(nn.Module):
             predictions = self.project(decoder_outputs)
             finished = (predictions == EOS).any(dim=1)
             predictions[~finished, -1] = EOS
-            predictions = torch.cat([bos((B, 1)), predictions], dim=1)
+            predictions = torch.cat([bos((B, 1)).to(predictions.device), predictions], dim=1)
             return predictions
 
         predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)  # (B, T_max)
@@ -712,20 +710,20 @@ class ApproximatorTrainer(Trainer):
     def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
+        y_pred = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         return (y_pred,)
 
     def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred_tch = self.model.forward(x, y[:, :-1], teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
-        y_pred_gen = self.model.forward(x, y[:, :-1], teacher_force_ratio=0.0)
+        y_pred_tch = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
+        y_pred_gen = self.model.forward(x, y, teacher_force_ratio=0.0)
         return (y_pred_tch, y_pred_gen)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
         y: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
-        loss: Tensor = self.loss_fn.forward(y_pred, y[:, 1:])
+        loss: Tensor = self.loss_fn.forward(y_pred, y)
         return loss, {}
 
     # FIXME: compute metrics needs to operate on an entire list of items or else the
@@ -873,7 +871,7 @@ def main() -> None:
     print("-" * 80)
 
     collate_fn = ApproximatorCollateFn(max_length=args.max_length)
-    loss_fn = ApproximatorLossFn(allow_different_lengths=True)
+    loss_fn = ApproximatorLossFn(timing_weight=1.0, length_weight=1.0)
     trainer_args = TrainerArgs(
         outdir=oh.path,
         device=args.device,
