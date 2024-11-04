@@ -76,7 +76,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_data
-from src.metrics import normalized_deviation,normalized_root_mean_squared_error
+from src.metrics import normalized_deviation, normalized_root_mean_squared_error
 from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser, TeacherRatioScheduler, EarlyStopper
 from src.utils import (
     count_parameters,
