@@ -12,6 +12,47 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from scipy.stats import norm
+
+
+def zscore_from_confidence(confidence_level: float) -> float:
+    # Compute the z-score corresponding to the confidence level
+    z_score = norm.ppf((1 + confidence_level) / 2)
+    return z_score
+
+
+def confidence_interval(x: np.ndarray, c: float = 0.95) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Basic confidence interval for a series of observations.
+
+    Args:
+        x (np.ndarray): data
+        c (float, optional): confidence level
+
+    Returns:
+        np.ndarray: mean
+        np.ndarray: interval
+        np.ndarray: standard deviation
+
+    Usage:
+        >>> # One experiment; five observations
+        >>> x = np.array([1, 2, 3, 4, 5])
+        >>> m, i, s = confidence_interval(x)
+        >>> # Two experiments; five observations each
+        >>> x = np.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        >>> m, i, s = confidence_interval(x)
+    """
+    if isinstance(x, list):
+        x = np.array(x)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if x.ndim != 2:
+        raise TypeError("Input must be a 1D or 2D array.")
+
+    z = norm.ppf((1 + c) / 2)
+    m = x.mean(axis=1)
+    s = x.std(axis=1)
+    i = z * s / np.sqrt(x.shape[0])
+    return m, i, s
 
 
 class Analyzer:
