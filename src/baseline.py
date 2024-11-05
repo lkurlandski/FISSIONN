@@ -1,13 +1,17 @@
 """
+Compute baseline metrics for IPD transformation using stochasitc model.
 
-Length MSE: 1131771.8343740944
-Length MAE: 346.0432903854768
-Length NDEV: 0.5594676733016968
-Length NRMSE: 1.719982385635376
-IPD MSE: 0.005702686853587054
-IPD MAE: 0.009381473744248041
-IPD NDEV: 13.200252532958984
-IPD NRMSE: 106.25537872314453
+RESULTS
+-------
+{
+ 'length_mae': 345.9457092285156,
+ 'length_mse': 1132191.875,
+ 'length_r2': 0.48062682151794434,
+ 'timing_mae': 0.00937829352915287,
+ 'timing_mse': 0.005738102365285158,
+ 'timing_nrmse': 8.561403274536133,
+ 'timing_r2': -0.014659881591796875,
+}
 """
 
 from argparse import ArgumentParser
@@ -129,22 +133,31 @@ def main():
     predictions = []
     for x_i in tqdm(batched(x, args.batch_size), total=total // args.batch_size, desc="Generating predictions..."):
         predictions.extend(synthetic_hops(x_i, args.num_workers))
+    y_true = [torch.from_numpy(y_i).to(torch.float32) for y_i in y]
+    y_pred = [torch.from_numpy(y_i).to(torch.float32) for y_i in predictions]
 
-    lengths = [(len(y_h), len(y_i)) for y_h, y_i in zip(predictions, y)]
-    lengths = np.array(lengths)
-    y_true = lengths[:, 0]
-    y_pred = lengths[:, 1]
-    report = regression_report(y_true, y_pred)
-    print(f"Length: {pformat(report)}")
+    # Below is a copy-paste form the Approximator.compute_metrics.
 
-    for i in range(total):
-        l = min(lengths[i][0], lengths[i][1])
-        y[i] = y[i][0:l]
-        predictions[i] = predictions[i][0:l]
-    y_true = np.concatenate(y)
-    y_pred = np.concatenate(predictions)
-    report = regression_report(y_true, y_pred)
-    print(f"Timing: {pformat(report)}")
+    NUM = len(y_true)                          # Number of sequences
+    LEN = ("r2", "mae", "mse")                 # Length metrics
+    IPD = ("r2", "mae", "mse", "nrmse", "nd")  # IPD metrics
+    metrics = {}
+
+    # Compute the length metrics, not considering the length added by BOS and EOS tokens.
+    lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
+    y_tr = lengths[:, 0] - 2
+    y_pr = lengths[:, 1] - 2
+    m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
+    metrics.update({f"length_{k}": v for k, v in m.items() if k in LEN})
+
+    # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
+    minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
+    y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
+    y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
+    m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
+    metrics.update({f"timing_{k}": v for k, v in m.items() if k in IPD})
+
+    pprint(metrics)
 
 
 if __name__ == "__main__":
