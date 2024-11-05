@@ -209,26 +209,27 @@ class ApproximatorLossFn(nn.Module):
         super().__init__()
         self.timing_weight = timing_weight
         self.length_weight = length_weight
-        self.loss_fn = nn.MSELoss()
 
     def forward(self, y_pred: Tensor, y_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
-        B = y_pred.size(0)
+        y_pred = remove_padding(y_pred)
+        y_true = remove_padding(y_true)
 
-        # Determine the length of the predicted and target sequences, then compute the length loss.
-        def get_length(y: Tensor):
-            return (y == EOS).nonzero(as_tuple=False).max().item()
+        NUM = len(y_pred)
 
-        lengths = [(get_length(y_pred[i]), get_length(y_true[i])) for i in range(B)]
-        lengths = torch.tensor(lengths, device=y_pred.device)
-        length_loss = F.mse_loss(lengths[:, 0].to(torch.float32), lengths[:, 1].to(torch.float32))
+        # Compute the length loss, not considering the length added by BOS and EOS tokens.
+        lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
+        y_tr = lengths[:, 0] - 2
+        y_pr = lengths[:, 1] - 2
+        length_loss = F.mse_loss(y_pr, y_tr)
 
-        # Consider only the tokens up to the length of the shortest sequence, then compute the timing loss.
-        y_pred = pad_sequence([y_pred[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
-        y_true = pad_sequence([y_true[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
-        timing_loss = F.mse_loss(y_pred, y_true)
+        # Compute the timing loss over the shorter of the two sequences, excluding BOS and EOS tokens.
+        minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
+        y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
+        y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
+        timing_loss = F.mse_loss(y_pr, y_tr)
 
         # Combine the timing and length losses.
         weighted_loss = self.timing_weight * timing_loss + self.length_weight * length_loss
@@ -747,24 +748,21 @@ class ApproximatorTrainer(Trainer):
 
         metrics = {}
         for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
+            # Compute the length metrics, not considering the length added by BOS and EOS tokens.
             lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
-            m = regression_report(lengths[:, 0].numpy(force=True), lengths[:, 1].numpy(force=True))
+            y_tr = lengths[:, 0] - 2
+            y_pr = lengths[:, 1] - 2
+            m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
             metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in LEN})
 
+            # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
             minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
-            y_tr = torch.cat([y_true[i][:l-1] for i, l in enumerate(minimum)])
-            y_pr = torch.cat([y_pred[i][:l-1] for i, l in enumerate(minimum)])
-            for tok in (EOS, PAD):
+            y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
+            y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
+            for tok in (BOS, EOS, PAD):
                 for ten in (y_tr, y_pr):
                     if (ten == tok).any():
                         raise RuntimeError(f"{tok=} found in {ten.tolist()=}")
-
-            mask = y_tr == BOS
-            if (y_pr[mask] != BOS).any():
-                raise RuntimeError("BOS indices in y_tr and y_pr do not match.")
-            y_tr = y_tr[~mask]
-            y_pr = y_pr[~mask]
-
             m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
             metrics.update({f"{name}_timing_{k}": v for k, v in m.items() if k in IPD})
 
