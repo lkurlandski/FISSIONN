@@ -742,9 +742,8 @@ class ApproximatorTrainer(Trainer):
         y_pred_tch = remove_padding(y_pred_tch)
         y_pred_gen = remove_padding(y_pred_gen)
 
-        NUM = len(y_true)                          # Number of sequences
-        LEN = ("r2", "mae", "mse")                 # Length metrics
-        IPD = ("r2", "mae", "mse", "nrmse", "nd")  # IPD metrics
+        NUM = len(y_true)                            # Number of sequences
+        MET = ("r2", "mae", "mse", "nrmse", "ndev")  # Metrics
 
         metrics = {}
         for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
@@ -753,7 +752,7 @@ class ApproximatorTrainer(Trainer):
             y_tr = lengths[:, 0] - 2
             y_pr = lengths[:, 1] - 2
             m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
-            metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in LEN})
+            metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in MET})
 
             # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
             minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
@@ -764,7 +763,7 @@ class ApproximatorTrainer(Trainer):
                     if (ten == tok).any():
                         raise RuntimeError(f"{tok=} found in {ten.tolist()=}")
             m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
-            metrics.update({f"{name}_timing_{k}": v for k, v in m.items() if k in IPD})
+            metrics.update({f"{name}_timing_{k}": v for k, v in m.items() if k in MET})
 
         return metrics
 

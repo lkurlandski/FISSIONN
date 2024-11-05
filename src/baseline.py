@@ -3,14 +3,44 @@ Compute baseline metrics for IPD transformation using stochasitc model.
 
 RESULTS
 -------
+max_length: 64
 {
- 'length_mae': 345.9457092285156,
- 'length_mse': 1132191.875,
- 'length_r2': 0.48062682151794434,
- 'timing_mae': 0.00937829352915287,
- 'timing_mse': 0.005738102365285158,
- 'timing_nrmse': 8.561403274536133,
- 'timing_r2': -0.014659881591796875,
+ 'length_mae': 22.262060165405273,
+ 'length_mse': 536.0961303710938,
+ 'length_ndev': 0.5603351593017578,
+ 'length_nrmse': 0.37352216243743896,
+ 'length_r2': -3107.142333984375,
+ 'timing_mae': 0.012232023291289806,
+ 'timing_mse': 0.0020123575814068317,
+ 'timing_ndev': 17.254379272460938,
+ 'timing_nrmse': 3.803612470626831,
+ 'timing_r2': -0.07701325416564941,
+}
+max_length: 128
+{
+ 'length_mae': 46.03347396850586,
+ 'length_mse': 2295.72216796875,
+ 'length_ndev': 0.5856590270996094,
+ 'length_nrmse': 0.3859179615974426,
+ 'length_r2': -26.468759536743164,
+ 'timing_mae': 0.015545784495770931,
+ 'timing_mse': 0.0048371972516179085,
+ 'timing_ndev': 21.774375915527344,
+ 'timing_nrmse': 4.608433246612549,
+ 'timing_r2': -0.05042243003845215,
+}
+max_length: 256
+{
+ 'length_mae': 85.72103881835938,
+ 'length_mse': 8759.0263671875,
+ 'length_ndev': 0.6410614848136902,
+ 'length_nrmse': 0.43246957659721375,
+ 'length_r2': -2.602083444595337,
+ 'timing_mae': 0.016090068966150284,
+ 'timing_mse': 0.007850836031138897,
+ 'timing_ndev': 22.558767318725586,
+ 'timing_nrmse': 5.678414821624756,
+ 'timing_r2': -0.03260445594787598,
 }
 """
 
@@ -111,6 +141,7 @@ def synthetic_hops(ipds: list[np.ndarray] | np.ndarray, num_workers: int = 1) ->
 def main():
 
     parser = ArgumentParser()
+    parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--pair_mode", type=str, default="single_hops")
     parser.add_argument("--num_workers", type=int, default=1)
@@ -127,8 +158,8 @@ def main():
     x = []
     y = []
     for src, tgt in tqdm(dataset, total=total, desc="Prepping data..."):
-        x.append(src.numpy())
-        y.append(tgt.numpy())
+        x.append(src.numpy()[0:args.max_length - 2])
+        y.append(tgt.numpy()[0:args.max_length - 2])
 
     predictions = []
     for x_i in tqdm(batched(x, args.batch_size), total=total // args.batch_size, desc="Generating predictions..."):
@@ -136,26 +167,25 @@ def main():
     y_true = [torch.from_numpy(y_i).to(torch.float32) for y_i in y]
     y_pred = [torch.from_numpy(y_i).to(torch.float32) for y_i in predictions]
 
-    # Below is a copy-paste form the Approximator.compute_metrics.
+    # Below is nearly a copy-paste from the Approximator.compute_metrics.
 
-    NUM = len(y_true)                          # Number of sequences
-    LEN = ("r2", "mae", "mse")                 # Length metrics
-    IPD = ("r2", "mae", "mse", "nrmse", "nd")  # IPD metrics
+    NUM = len(y_true)                            # Number of sequences
+    MET = ("r2", "mae", "mse", "nrmse", "ndev")  # Metrics
     metrics = {}
 
     # Compute the length metrics, not considering the length added by BOS and EOS tokens.
     lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
-    y_tr = lengths[:, 0] - 2
-    y_pr = lengths[:, 1] - 2
+    y_tr = lengths[:, 0]
+    y_pr = lengths[:, 1]
     m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
-    metrics.update({f"length_{k}": v for k, v in m.items() if k in LEN})
+    metrics.update({f"length_{k}": v for k, v in m.items() if k in MET})
 
     # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
     minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
-    y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
-    y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
+    y_tr = torch.cat([y_true[i][:l] for i, l in enumerate(minimum)])
+    y_pr = torch.cat([y_pred[i][:l] for i, l in enumerate(minimum)])
     m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
-    metrics.update({f"timing_{k}": v for k, v in m.items() if k in IPD})
+    metrics.update({f"timing_{k}": v for k, v in m.items() if k in MET})
 
     pprint(metrics)
 
