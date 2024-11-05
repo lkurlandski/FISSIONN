@@ -14,7 +14,7 @@ import shutil
 from statistics import mean
 import sys
 import time
-from typing import Callable, Optional, Self
+from typing import Any, Callable, Optional, Self
 import warnings
 
 import torch
@@ -141,9 +141,9 @@ class Trainer(ABC):
         self.collate_fn = collate_fn
         self.loss_fn = loss_fn
         self.optimizer = self.create_optimizer()
-        self.scheduler = self.create_scheduler()
-        self.stopper = self.create_stopper()
-        self.teacher_ratio_scheduler = self.create_teacher_ratio_scheduler()
+        self.scheduler = self.create_scheduler()                              # pylint: disable=assignment-from-none
+        self.stopper = self.create_stopper()                                  # pylint: disable=assignment-from-none
+        self.teacher_ratio_scheduler = self.create_teacher_ratio_scheduler()  # pylint: disable=assignment-from-none
         self.log = []
         self.best_epoch = -1
         self.best_metric = -sys.maxsize if args.lower_is_worse else sys.maxsize
@@ -336,21 +336,22 @@ class Trainer(ABC):
         dataloader = self.get_vl_dataloader()
         pbar = self._get_pbar(dataloader, total=len(self.vl_dataset) // self.args.vl_batch_size, desc="Validating...", leave=False)
         with torch.no_grad():
+            inputs = defaultdict(list)
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
 
                 outputs = self.forward_eval(batch)
                 loss, losses = self.compute_loss(batch, outputs)
-                metrics = self.compute_metrics(batch, outputs)
+                for k, v in self.get_compute_metrics_inputs(batch, outputs).items():
+                    inputs[k].extend(v)
 
                 results["vl_loss"].append(loss.item())
                 for k, v in losses.items():
-                    results[f"vl_{k}"].append(v)
-                for k, v in metrics.items():
                     results[f"vl_{k}"].append(v)
 
         for k, v in results.items():
             results[k] = mean(v)
         results["vl_time"] = time.time() - t_0
+        results |= {f"vl_{k}": v for k, v in self.compute_metrics(**inputs).items()}
 
         return dict(results)
 
@@ -381,13 +382,23 @@ class Trainer(ABC):
             dict[str, float]: auxillary losses over the batch.
         """
 
-    def compute_metrics(self, batch: tuple, outputs: tuple) -> dict[str, float]:  # pylint: disable=unused-argument
-        """Compute the validation metrics over a batch of examples.
+    def compute_metrics(self, **kwds: list[Any]) -> dict[str, float]:  # pylint: disable=unused-argument
+        """Compute the validation metrics over a set of examples.
+
+        Args:
+            kwds (dict[str, List[Any]]): keyword arguments as returned by self.get_compute_metrics_inputs.
+
+        Returns:
+            dict[str, float]: metrics for the set.
+        """
+        return {}
+
+    def get_compute_metrics_inputs(self, batch: tuple, outputs: tuple) -> dict[str, list]:  # pylint: disable=unused-argument
+        """Extract the inputs for self.compute_metrics from a batch of inputs and outputs for computing metrics.
 
         Args:
             batch (tuple): batch of inputs.
             outputs (tuple): model output(s), e.g., logits, as return by self.forward.
-            loss (Tensor): model loss over the batch.
 
         Returns:
             dict[str, float]: metrics for the batch.

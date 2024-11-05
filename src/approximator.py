@@ -47,6 +47,7 @@ with sdpa_kernel(SDPBackend.MATH):
 
 from __future__ import annotations
 from collections.abc import Iterable
+from collections import defaultdict
 from itertools import chain, combinations
 import math
 import multiprocessing as mp
@@ -76,7 +77,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.data import load_data
-from src.metrics import normalized_deviation, normalized_root_mean_squared_error
+from src.metrics import regression_report
 from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser, TeacherRatioScheduler, EarlyStopper
 from src.utils import (
     count_parameters,
@@ -204,7 +205,7 @@ class ApproximatorLossFn(nn.Module):
         self.length_weight = length_weight
         self.loss_fn = nn.MSELoss()
 
-    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
+    def forward(self, y_pred: Tensor, y_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
@@ -216,16 +217,16 @@ class ApproximatorLossFn(nn.Module):
 
         lengths = [(get_length(y_pred[i]), get_length(y_true[i])) for i in range(B)]
         lengths = torch.tensor(lengths, device=y_pred.device)
-        loss_lengths = F.mse_loss(lengths[:, 0].to(torch.float32), lengths[:, 1].to(torch.float32))
+        length_loss = F.mse_loss(lengths[:, 0].to(torch.float32), lengths[:, 1].to(torch.float32))
 
         # Consider only the tokens up to the length of the shortest sequence, then compute the timing loss.
         y_pred = pad_sequence([y_pred[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
         y_true = pad_sequence([y_true[i, 1:lengths[i].min() - 1] for i in range(B)], batch_first=True, padding_value=PAD)
-        loss_timings = F.mse_loss(y_pred, y_true)
+        timing_loss = F.mse_loss(y_pred, y_true)
 
         # Combine the timing and length losses.
-        loss = self.timing_weight * loss_timings + self.length_weight * loss_lengths
-        return loss
+        weighted_loss = self.timing_weight * timing_loss + self.length_weight * length_loss
+        return weighted_loss, length_loss, timing_loss
 
     @staticmethod
     def prepare_inputs_and_targets(
@@ -723,51 +724,47 @@ class ApproximatorTrainer(Trainer):
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
         y: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
-        loss: Tensor = self.loss_fn.forward(y_pred, y)
-        return loss, {}
+        loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y)
+        return loss, {"length_loss": length_loss, "timing_loss": timing_loss}
 
-    # FIXME: compute metrics needs to operate on an entire list of items or else the
-    # seq2seq metrics will not be accurate.
-    def compute_metrics(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Tensor]) -> dict[str, float]:
-        y: Tensor = batch[1].to(self.args.device)
-        y = y[:, 1:]
-        y_pred_tch: Tensor = outputs[0]
-        y_pred_gen: Tensor = outputs[1]
+    def compute_metrics(self, y_true: list[Tensor], y_pred_tch: list[Tensor], y_pred_gen: list[Tensor]) -> dict[str, float]:
+        if not len(y_true) == len(y_pred_tch) == len(y_pred_gen):
+            raise ValueError(f"Lengths of {y_true=}, {y_pred_tch=}, and {y_pred_gen=} do not match.")
 
-        # ndigits = 4
-        # nvalues = 4
-        # _mean   = round(y_pred_tch[0].mean().item(), ndigits)
-        # _median = round(y_pred_tch[0].median().item(), ndigits)
-        # _std    = round(y_pred_tch[0].std().item(), ndigits)
-        # _head   = [round(i.item(), ndigits) for i in y_pred_tch[0][0:nvalues]]
-        # _tail   = [round(i.item(), ndigits) for i in y_pred_tch[0][-nvalues:]]
-        # print(f"y_pred_tch: {_mean=} {_median=} {_std=} {_head=} {_tail=}")
-        # _mean   = round(y_pred_gen[0].mean().item(), ndigits)
-        # _median = round(y_pred_gen[0].median().item(), ndigits)
-        # _std    = round(y_pred_gen[0].std().item(), ndigits)
-        # _head   = [round(i.item(), ndigits) for i in y_pred_gen[0][0:nvalues]]
-        # _tail   = [round(i.item(), ndigits) for i in y_pred_tch[0][-nvalues:]]
-        # print(f"y_pred_gen: {_mean=} {_median=} {_std=} {_head=} {_tail=}")
+        NUM = len(y_true)                          # Number of sequences
+        LEN = ("r2", "mae", "mse")                 # Length metrics
+        IPD = ("r2", "mae", "mse", "nrmse", "nd")  # IPD metrics
 
-        loss_tch = self.loss_fn.forward(y_pred_tch, y)
-        loss_gen = self.loss_fn.forward(y_pred_gen, y)
+        metrics = {}
+        for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
+            lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
+            m = regression_report(lengths[:, 0].numpy(True), lengths[:, 1].numpy(True))
+            metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in LEN})
 
-        y_pred_tch_masked, y_true_tch_masked = ApproximatorLossFn.prepare_inputs_and_targets(y_pred_tch, y, True)
-        y_pred_gen_masked, y_true_gen_masked = ApproximatorLossFn.prepare_inputs_and_targets(y_pred_gen, y, True)
+            minimum = lengths.min(dim=1).tolist()
+            y_tr = torch.cat([y_true[i][:l] for i, l in enumerate(minimum)])
+            y_pr = torch.cat([y_pred[i][:l] for i, l in enumerate(minimum)])
+            if ((y_tr == EOS) | (y_tr == PAD)).any():
+                raise RuntimeError("PAD or EOS found in y_tr")
+            if ((y_pr == EOS) | (y_pr == PAD)).any():
+                raise RuntimeError("PAD or EOS found in y_pr")
 
-        nrmse_tch = normalized_root_mean_squared_error(y_pred_tch_masked, y_true_tch_masked)
-        nrmse_gen = normalized_root_mean_squared_error(y_pred_gen_masked, y_true_gen_masked)
+            mask = y_tr == BOS
+            if (y_pr[mask] != BOS).any():
+                raise RuntimeError("BOS indices in y_tr and y_pr do not match.")
+            y_tr = y_tr[~mask]
+            y_pr = y_pr[~mask]
 
-        nd_tch = normalized_deviation(y_pred_tch_masked, y_true_tch_masked)
-        nd_gen = normalized_deviation(y_pred_gen_masked, y_true_gen_masked)
+            m = regression_report(y_tr.numpy(True), y_pr.numpy(True))
+            metrics.update({f"{name}_timing_{k}": v for k, v in m.items() if k in IPD})
 
+        return metrics
+
+    def get_compute_metrics_inputs(self, batch: tuple, outputs: tuple) -> dict[str, list[Tensor]]:
         return {
-            "loss_tch": loss_tch.item(),
-            "loss_gen": loss_gen.item(),
-            "nrmse_tch": nrmse_tch.item(),
-            "nrmse_gen": nrmse_gen.item(),
-            "nd_tch": nd_tch.item(),
-            "nd_gen": nd_gen.item(),
+            "y_true": batch[1],
+            "y_pred_tch": outputs[0],
+            "y_pred_gen": outputs[1],
         }
 
 

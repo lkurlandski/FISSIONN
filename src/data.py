@@ -4,7 +4,6 @@
 from collections import namedtuple
 from dataclasses import dataclass
 import pickle
-import numpy as np
 from typing import Generator, Optional, TypeAlias
 
 import numpy as np

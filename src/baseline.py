@@ -14,7 +14,7 @@ from argparse import ArgumentParser
 from itertools import batched
 import math
 import multiprocessing as mp
-from pprint import pprint
+from pprint import pformat, pprint
 import random
 import os
 from statistics import quantiles
@@ -25,7 +25,6 @@ import matplotlib
 from matplotlib import pyplot as plt
 import numpy as np
 from scipy import stats
-from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
 import torch
 from tqdm import tqdm
@@ -36,7 +35,7 @@ if __name__ == "__main__":
 
 from src.approximator import ApproximatorDataset, BUILDER_PAIR_MODES
 from src.data import extract_data, Stream, Chain
-from src.metrics import normalized_deviation, normalized_root_mean_squared_error
+from src.metrics import regression_report
 from src.utils import seed_everything
 
 
@@ -135,16 +134,8 @@ def main():
     lengths = np.array(lengths)
     y_true = lengths[:, 0]
     y_pred = lengths[:, 1]
-    mse = mean_squared_error(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    y_true = torch.from_numpy(y_true).to(torch.float32)
-    y_pred = torch.from_numpy(y_pred).to(torch.float32)
-    ndev  = normalized_deviation(y_pred, y_true).item()
-    nrmse = normalized_root_mean_squared_error(y_pred, y_true).item()
-    print(f"Length MSE: {mse}")
-    print(f"Length MAE: {mae}")
-    print(f"Length NDEV: {ndev}")
-    print(f"Length NRMSE: {nrmse}")
+    report = regression_report(y_true, y_pred)
+    print(f"Length: {pformat(report)}")
 
     for i in range(total):
         l = min(lengths[i][0], lengths[i][1])
@@ -152,17 +143,8 @@ def main():
         predictions[i] = predictions[i][0:l]
     y_true = np.concatenate(y)
     y_pred = np.concatenate(predictions)
-
-    mse = mean_squared_error(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    y_true = torch.from_numpy(y_true).to(torch.float32)
-    y_pred = torch.from_numpy(y_pred).to(torch.float32)
-    ndev  = normalized_deviation(y_pred, y_true).item()
-    nrmse = normalized_root_mean_squared_error(y_pred, y_true).item()
-    print(f"IPD MSE: {mse}")
-    print(f"IPD MAE: {mae}")
-    print(f"IPD NDEV: {ndev}")
-    print(f"IPD NRMSE: {nrmse}")
+    report = regression_report(y_true, y_pred)
+    print(f"Timing: {pformat(report)}")
 
 
 if __name__ == "__main__":

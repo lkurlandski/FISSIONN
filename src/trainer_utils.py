@@ -1,5 +1,5 @@
 """
-
+Utilities for the Trainer class.
 """
 
 from functools import partial

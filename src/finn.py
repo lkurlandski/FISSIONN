@@ -528,6 +528,7 @@ class FinnTrainer(Trainer):
         loss, enc_loss, dec_loss = self.loss_fn.forward(delay_pred, delay, fingerprint_pred, fingerprint)
         return loss, {"enc_loss": enc_loss.item(), "dec_loss": dec_loss.item()}
 
+    # TODO: compute_metrics should operate over the output of the entire evaluation set, not just a single batch.
     def compute_metrics(self, batch: tuple[Tensor, Tensor, Tensor, Optional[Tensor]], outputs: tuple[Tensor, Tensor]) -> dict[str, float]:
         fingerprint = batch[0].to(self.args.device)
         fingerprint_pred = outputs[1].to(self.args.device)
