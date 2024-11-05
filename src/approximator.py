@@ -379,16 +379,21 @@ class RecurrentApproximator(nn.Module):
         x = self.dropout.forward(x)
         return x
 
-    def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor]:
+    def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor, Optional[Tensor]]:
         if embeddings.dim() != 3:
             raise ShapeError((embeddings.shape), ("B", "T", "H"))
-        x = self.encoder.forward(embeddings)
-        return x
+        encoder_states = None
+        if isinstance(self.encoder, nn.LSTM):
+            encoder_outputs, (encoder_hidden, encoder_states) = self.encoder.forward(embeddings)
+        else:
+            encoder_outputs, encoder_hidden = self.encoder.forward(embeddings)
+        return encoder_outputs, encoder_hidden, encoder_states
 
     def decode(
         self,
         encoder_outputs: Tensor,
         encoder_hidden: Tensor,
+        encoder_states: Optional[Tensor] = None,
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
@@ -397,6 +402,8 @@ class RecurrentApproximator(nn.Module):
             raise ShapeError((encoder_outputs.shape), ("B", "L", "H"))
         if encoder_hidden.dim() != 3:
             raise ShapeError((encoder_hidden.shape), ("L", "B", "H"))
+        if encoder_states is not None and encoder_states.dim() != 3:
+            raise ShapeError((encoder_states.shape), ("L", "B", "H"))
         if targets is not None and targets.dim() != 2:
             raise ShapeError((targets.shape), ("B", "T - 1"))
 
@@ -415,6 +422,7 @@ class RecurrentApproximator(nn.Module):
         D = encoder_outputs.device
 
         decoder_hidden = encoder_hidden                                           # (L, B, H)
+        decoder_states = encoder_states                                           # (L, B, H)
         predictions = torch.cat([bos((B, 1)), pad((B, T_max - 1))], dim=1).to(D)  # (B, T_max)
         decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
 
@@ -426,7 +434,10 @@ class RecurrentApproximator(nn.Module):
 
             context, _ = self.attention.forward(final_hidden_state, encoder_outputs)                   # (B, 1, H), (B, 1, 2 * H)
             decoder_embeddings = torch.cat((embeddings, context), dim=2)                               # (B, 1, 2 * H)
-            decoder_output, decoder_hidden = self.decoder.forward(decoder_embeddings, decoder_hidden)  # (B, 1, H), (L, B, H)
+            if isinstance(self.decoder, nn.LSTM):
+                decoder_output, (decoder_hidden, decoder_states) = self.decoder.forward(decoder_embeddings, (decoder_hidden, decoder_states))  # (B, 1, H), (L, B, H), (L, B, H)
+            else:
+                decoder_output, decoder_hidden = self.decoder.forward(decoder_embeddings, decoder_hidden)  # (B, 1, H), (L, B, H)
 
             prediction = self.project(decoder_output)  # (B, T)
             prediction = prediction[:, -1]             # (B,)
@@ -467,11 +478,12 @@ class RecurrentApproximator(nn.Module):
         #     ApproximatorCollateFn.verify_has_bos(targets)
         #     ApproximatorCollateFn.verify_has_eos(targets)
 
-        embeddings = self.embed_src(inputs)                        # (B, T, H)
-        encoder_outputs, encoder_hidden = self.encode(embeddings)  # (B, T, H), (L, B, H)
+        embeddings = self.embed_src(inputs)                                        # (B, T, H)
+        encoder_outputs, encoder_hidden, encoder_states = self.encode(embeddings)  # (B, T, H), (L, B, H), (L, B, H)
         predictions = self.decode(
             encoder_outputs,
             encoder_hidden,
+            encoder_states,
             targets,
             teacher_force_ratio,
             teacher_force_batch_mode,
