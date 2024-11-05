@@ -108,6 +108,12 @@ def eos(shape: tuple[int]) -> Tensor:
     return torch.full(shape, EOS)
 
 
+def remove_padding(z: Tensor | list[Tensor]) -> list[Tensor]:
+    if isinstance(z, Tensor) and z.dim() == 1:
+        return z[z != PAD]
+    return [remove_padding(t) for t in z]
+
+
 class ApproximatorDataset(Dataset):
 
     def __init__(self, ipd_pairs: Iterable[tuple[list[float], list[float]]]) -> None:
@@ -725,11 +731,15 @@ class ApproximatorTrainer(Trainer):
         y: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
         loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y)
-        return loss, {"length_loss": length_loss, "timing_loss": timing_loss}
+        return loss, {"length_loss": length_loss.item(), "timing_loss": timing_loss.item()}
 
     def compute_metrics(self, y_true: list[Tensor], y_pred_tch: list[Tensor], y_pred_gen: list[Tensor]) -> dict[str, float]:
         if not len(y_true) == len(y_pred_tch) == len(y_pred_gen):
             raise ValueError(f"Lengths of {y_true=}, {y_pred_tch=}, and {y_pred_gen=} do not match.")
+
+        y_true     = remove_padding(y_true)
+        y_pred_tch = remove_padding(y_pred_tch)
+        y_pred_gen = remove_padding(y_pred_gen)
 
         NUM = len(y_true)                          # Number of sequences
         LEN = ("r2", "mae", "mse")                 # Length metrics
@@ -738,16 +748,16 @@ class ApproximatorTrainer(Trainer):
         metrics = {}
         for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
             lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
-            m = regression_report(lengths[:, 0].numpy(True), lengths[:, 1].numpy(True))
+            m = regression_report(lengths[:, 0].numpy(force=True), lengths[:, 1].numpy(force=True))
             metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in LEN})
 
-            minimum = lengths.min(dim=1).tolist()
-            y_tr = torch.cat([y_true[i][:l] for i, l in enumerate(minimum)])
-            y_pr = torch.cat([y_pred[i][:l] for i, l in enumerate(minimum)])
-            if ((y_tr == EOS) | (y_tr == PAD)).any():
-                raise RuntimeError("PAD or EOS found in y_tr")
-            if ((y_pr == EOS) | (y_pr == PAD)).any():
-                raise RuntimeError("PAD or EOS found in y_pr")
+            minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
+            y_tr = torch.cat([y_true[i][:l-1] for i, l in enumerate(minimum)])
+            y_pr = torch.cat([y_pred[i][:l-1] for i, l in enumerate(minimum)])
+            for tok in (EOS, PAD):
+                for ten in (y_tr, y_pr):
+                    if (ten == tok).any():
+                        raise RuntimeError(f"{tok=} found in {ten.tolist()=}")
 
             mask = y_tr == BOS
             if (y_pr[mask] != BOS).any():
@@ -755,16 +765,16 @@ class ApproximatorTrainer(Trainer):
             y_tr = y_tr[~mask]
             y_pr = y_pr[~mask]
 
-            m = regression_report(y_tr.numpy(True), y_pr.numpy(True))
+            m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
             metrics.update({f"{name}_timing_{k}": v for k, v in m.items() if k in IPD})
 
         return metrics
 
     def get_compute_metrics_inputs(self, batch: tuple, outputs: tuple) -> dict[str, list[Tensor]]:
         return {
-            "y_true": batch[1],
-            "y_pred_tch": outputs[0],
-            "y_pred_gen": outputs[1],
+            "y_true": [t for t in batch[1]],
+            "y_pred_tch": [t for t in outputs[0]],
+            "y_pred_gen": [t for t in outputs[1]],
         }
 
 
