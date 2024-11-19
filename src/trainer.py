@@ -219,7 +219,7 @@ class Trainer(ABC):
             if any(math.isnan(d[m]) or math.isinf(d[m]) for m in ("tr_loss", "vl_loss")):
                 raise ValueError("NaN/Inf Loss Detected!")
 
-    def evaluate_saved_models(self) -> None:
+    def evaluate_saved_models(self, epochs: Optional[list[int]] = None) -> None:
 
         @find_executable_batch_size(
             starting_batch_size=self.args.vl_batch_size,
@@ -236,7 +236,10 @@ class Trainer(ABC):
         outfile = self.args.outdir / "results_evaluation.jsonl"
         outfile.unlink(missing_ok=True)
 
-        pbar = self._get_pbar(range(self.args.epochs), desc="Epochs", total=self.args.epochs)
+        if epochs is None:
+            epochs = [i for i, _ in enumerate(self.args.outdir.glob("model_*.pth"))]
+
+        pbar = self._get_pbar(epochs, desc="Epochs")
         for epoch in pbar:
             checkpoint = self.args.outdir / f"model_{epoch}.pth"
             self.model = torch.load(checkpoint, map_location="cpu")

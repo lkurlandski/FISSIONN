@@ -138,32 +138,24 @@ def synthetic_hops(ipds: list[np.ndarray] | np.ndarray, num_workers: int = 1) ->
         return pool.map(synthetic_hop, ipds)
 
 
-def main():
+def main(seed: int = 0, max_length: Optional[int] = None, pair_mode: str = "single_hops", num_workers: int = 1, batch_size: int = 1024) -> dict[str, float]:
 
-    parser = ArgumentParser()
-    parser.add_argument("--max_length", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--pair_mode", type=str, default="single_hops")
-    parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=1024)
-    args = parser.parse_args()
-
-    seed_everything(args.seed)
+    seed_everything(seed)
 
     ipd_groups = [[s.ipds for s in c] for c in extract_data()]
-    build_pairs_fn = BUILDER_PAIR_MODES[args.pair_mode]
+    build_pairs_fn = BUILDER_PAIR_MODES[pair_mode]
     dataset = ApproximatorDataset(build_pairs_fn(ipd_groups))
     total = len(dataset)
 
     x = []
     y = []
     for src, tgt in tqdm(dataset, total=total, desc="Prepping data..."):
-        x.append(src.numpy()[0:args.max_length - 2])
-        y.append(tgt.numpy()[0:args.max_length - 2])
+        x.append(src.numpy()[0:max_length - 2])
+        y.append(tgt.numpy()[0:max_length - 2])
 
     predictions = []
-    for x_i in tqdm(batched(x, args.batch_size), total=total // args.batch_size, desc="Generating predictions..."):
-        predictions.extend(synthetic_hops(x_i, args.num_workers))
+    for x_i in tqdm(batched(x, batch_size), total=total // batch_size, desc="Generating predictions..."):
+        predictions.extend(synthetic_hops(x_i, num_workers))
     y_true = [torch.from_numpy(y_i).to(torch.float32) for y_i in y]
     y_pred = [torch.from_numpy(y_i).to(torch.float32) for y_i in predictions]
 
@@ -187,6 +179,20 @@ def main():
     m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
     metrics.update({f"timing_{k}": v for k, v in m.items() if k in MET})
 
+    return metrics
+
+
+def cli():
+
+    parser = ArgumentParser()
+    parser.add_argument("--max_length", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--pair_mode", type=str, default="single_hops")
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=1024)
+    args = parser.parse_args()
+
+    metrics = main(args.seed, args.max_length, args.pair_mode, args.num_workers, args.batch_size)
     pprint(metrics)
 
 
