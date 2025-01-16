@@ -63,6 +63,7 @@ import warnings
 import numpy as np
 from scipy import stats
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn, Tensor, BoolTensor
 from torch.nn import functional as F
@@ -220,7 +221,7 @@ class ApproximatorLossFn(nn.Module):
         self.timing_weight = timing_weight
         self.length_weight = length_weight
 
-    def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor, length_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
@@ -230,9 +231,7 @@ class ApproximatorLossFn(nn.Module):
         NUM = len(y_pred)
 
         # Compute the length loss, not considering the length added by BOS and EOS tokens.
-        y_tr = torch.tensor([len(y) for y in y_true], dtype=torch.float32, device=length_pred.device) - 2
-        y_pr = length_pred
-        length_loss = F.mse_loss(y_pr, y_tr)
+        length_loss = F.mse_loss(length_pred, length_true)
 
         # Compute the timing loss over the shorter of the two sequences, excluding BOS and EOS tokens.
         lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
@@ -520,16 +519,10 @@ class RecurrentApproximator(nn.Module):
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
-        trim_predictions: bool = False,
     ) -> tuple[Tensor, Tensor]:
 
         embeddings = self.embed_src(inputs)                                        # (B, T, H)
         encoder_outputs, encoder_hidden, encoder_states = self.encode(embeddings)  # (B, T, H), (L, B, H), (L, B, H)
-
-        output_lengths_f = self.predict_length(encoder_outputs)                    # (B,)
-        output_lengths_i = output_lengths_f.round().to(torch.int64)                # (B,)
-        max_length = output_lengths_i.max().item() if trim_predictions else None
-
         predictions = self.decode(
             encoder_outputs,
             encoder_hidden,
@@ -537,19 +530,23 @@ class RecurrentApproximator(nn.Module):
             targets,
             teacher_force_ratio,
             teacher_force_batch_mode,
-            max_length,
         )[0]
-        if trim_predictions:
-            predictions = LengthPredictionHead.trim_predictions_(predictions, output_lengths_i, TRIM_MINIMUM_LENGTH)
+        lengths = self.predict_length(encoder_outputs)
 
-        return predictions, output_lengths_f
+        return predictions, lengths
 
-    def translate(self, inputs: Tensor) -> Tensor:
+    def translate(self, inputs: Tensor, length_scaler: StandardScaler) -> Tensor:
         is_training = self.training
         if is_training:
             self.eval()
+
         with torch.no_grad():
-            targets = self.forward(inputs, None, 0.0, False, True)[0]
+            targets, lengths = self.forward(inputs, None, 0.0, False)
+        lengths = lengths.unsqueeze(1).numpy(force=True)
+        lengths = length_scaler.inverse_transform(lengths)
+        lengths = torch.tensor(lengths, device=targets.device).squeeze(1)
+        targets = LengthPredictionHead.trim_predictions_(targets, lengths, TRIM_MINIMUM_LENGTH)
+
         if is_training:
             self.train()
         return targets
@@ -737,39 +734,36 @@ class TransformerApproximator(nn.Module):
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
-        trim_predictions: bool = False,
     ) -> tuple[Tensor, Tensor]:
 
         src_mask = torch.zeros(
             (inputs.size(1), inputs.size(1)), dtype=torch.bool, device=inputs.device
         )
         src_padding_mask = (inputs == PAD).to(inputs.device)
-
         embeddings = self.embed_src(inputs)
         encoder_outputs = self.encode(embeddings, src_mask, src_padding_mask)
-
-        output_lengths_f = self.predict_length(encoder_outputs)
-        output_lengths_i = output_lengths_f.round().to(torch.int64)
-        max_length = output_lengths_i.max().item() if trim_predictions else None
-
         predictions = self.decode(
             encoder_outputs,
             targets,
             teacher_force_ratio,
             teacher_force_batch_mode,
-            max_length,
         )
-        if trim_predictions:
-            predictions = LengthPredictionHead.trim_predictions_(predictions, output_lengths_i, TRIM_MINIMUM_LENGTH)
+        lengths = self.predict_length(encoder_outputs)
 
-        return predictions, output_lengths_f
+        return predictions, lengths
 
-    def translate(self, inputs: Tensor) -> Tensor:
+    def translate(self, inputs: Tensor, length_scaler: StandardScaler) -> Tensor:
         is_training = self.training
         if is_training:
             self.eval()
+
         with torch.no_grad():
-            targets = self.forward(inputs, None, 0.0, False, True)[0]
+            targets, lengths = self.forward(inputs, None, 0.0, False)
+        lengths = lengths.unsqueeze(1).numpy(force=True)
+        lengths = length_scaler.inverse_transform(lengths)
+        lengths = torch.tensor(lengths, device=targets.device).squeeze(1)
+        targets = LengthPredictionHead.trim_predictions_(targets, lengths, TRIM_MINIMUM_LENGTH)
+
         if is_training:
             self.train()
         return targets
@@ -786,6 +780,10 @@ class ApproximatorTrainer(Trainer):
     vl_dataset: ApproximatorDataset
     collate_fn: ApproximatorCollateFn
     loss_fn: ApproximatorLossFn
+
+    def __init__(self, *args, length_scaler: StandardScaler, **kwds) -> None:
+        super().__init__(*args, **kwds)
+        self.length_scaler = length_scaler
 
     def __call__(self) -> Self:
         with sdpa_kernel(BACKEND):
@@ -806,21 +804,25 @@ class ApproximatorTrainer(Trainer):
     def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Optional[Tensor], Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred, length_pred = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio, trim_predictions=TRIM_IN_TR)
+        y_pred, length_pred = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         return (y_pred, None, length_pred)
 
     def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred_tch, _ = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio, trim_predictions=TRIM_IN_VL)
-        y_pred_gen, length_pred = self.model.forward(x, y, teacher_force_ratio=0.0, trim_predictions=TRIM_IN_TR)
+        y_pred_tch, _ = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
+        y_pred_gen, length_pred = self.model.forward(x, y, teacher_force_ratio=0.0)
         return (y_pred_tch, y_pred_gen, length_pred)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Optional[Tensor], Tensor]) -> tuple[Tensor, dict[str, float]]:
         y: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
+        length = torch.tensor(
+            self.length_scaler.transform(np.expand_dims(np.array([len(y_) for y_ in y]), 1)),
+            dtype=torch.float32, device=y.device,
+        ).squeeze(1)
         length_pred: Tensor = outputs[2]
-        loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y, length_pred)
+        loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y, length_pred, length)
         return loss, {"length_loss": length_loss.item(), "timing_loss": timing_loss.item()}
 
     def compute_metrics(  # pylint: disable=arguments-differ
@@ -844,9 +846,9 @@ class ApproximatorTrainer(Trainer):
         for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
 
             # Compute the length metrics, not considering the length added by BOS and EOS tokens.
-            y_tr = torch.tensor([len(y) for y in y_true], dtype=torch.float32) - 2
-            y_pr = torch.tensor(length_pred)
-            m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
+            y_tr = torch.tensor([len(y) for y in y_true], dtype=torch.float32).numpy(force=True) - 2
+            y_pr = self.length_scaler.inverse_transform(torch.tensor(length_pred).unsqueeze(1).numpy(force=True), 1).squeeze(1)
+            m = regression_report(y_tr, y_pr)
             metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in MET})
 
             # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
@@ -955,6 +957,11 @@ def main() -> None:
     print(f"Validation Dataset: {vl_dataset}. Length: {len(vl_dataset)}")
     print("-" * 80)
 
+    lengths = [(len(x), len(y)) for x, y in tr_dataset.dataset.ipd_pairs]
+    lengths = np.expand_dims(np.array(lengths).flatten(), 1)
+    length_scaler = StandardScaler().fit(lengths, 1)
+    print(f"Length Scaler: {length_scaler}")
+
     if args.arch == "transformer":
         config = {"max_length": args.max_length} | getattr(TransformerApproximator, args.arch_config.upper())
         model = TransformerApproximator(**config)
@@ -995,6 +1002,7 @@ def main() -> None:
         vl_dataset,
         collate_fn,
         loss_fn,
+        length_scaler=length_scaler,
     )
 
     trainer()
