@@ -45,6 +45,7 @@ class TestApproximators(unittest.TestCase):
         self.embeddings = torch.rand(self.batch_size, self.input_length, self.hidden_size)
         self.encoder_outputs = torch.rand(self.batch_size, self.input_length, self.hidden_size)
         self.encoder_hidden = torch.rand(self.num_layers, self.batch_size, self.hidden_size)
+        self.encoder_states = torch.rand(self.num_layers, self.batch_size, self.hidden_size) if self.rec.cell == "lstm" else None
         self.decoder_outputs = torch.rand(self.batch_size, self.target_length, self.hidden_size)
 
     def _test_embed_src(self, embeddings: Tensor):
@@ -75,7 +76,7 @@ class TestApproximators(unittest.TestCase):
         embeddings = self.trn.embed_tgt(self.targets)
         self._test_embed_tgt(embeddings)
 
-    def _test_encoder_outputs(self, outputs: Tensor, hidden: Tensor):
+    def _test_encoder_outputs(self, outputs: Tensor, hidden: Optional[Tensor], states: Optional[Tensor]):
         assert outputs.dim() == 3
         assert outputs.size(0) == self.batch_size
         assert outputs.size(1) == self.input_length
@@ -87,13 +88,31 @@ class TestApproximators(unittest.TestCase):
             assert hidden.size(1) == self.batch_size
             assert hidden.size(2) == self.hidden_size
 
+        if states is not None:
+            assert states.dim() == 3
+            assert states.size(0) == self.num_layers
+            assert states.size(1) == self.batch_size
+            assert states.size(2) == self.hidden_size
+
     def test_encode_rec(self):
-        outputs, hidden = self.rec.encode(self.embeddings)
-        self._test_encoder_outputs(outputs, hidden)
+        outputs, hidden, states = self.rec.encode(self.embeddings)
+        self._test_encoder_outputs(outputs, hidden, states)
 
     def test_encode_trn(self):
         outputs = self.trn.encode(self.embeddings, None, None)
-        self._test_encoder_outputs(outputs, None)
+        self._test_encoder_outputs(outputs, None, None)
+
+    def _test_lengths(self, lengths: Tensor):
+        assert lengths.dim() == 1, lengths.shape
+        assert lengths.size(0) == self.batch_size
+
+    def test_predict_length_rec(self):
+        lengths = self.rec.predict_length(self.encoder_outputs)
+        self._test_lengths(lengths)
+
+    def test_predict_length_trn(self):
+        lengths = self.trn.predict_length(self.encoder_outputs)
+        self._test_lengths(lengths)
 
     def _test_decode(self, predictions: Tensor):
         assert predictions.dim() == 2
@@ -103,7 +122,7 @@ class TestApproximators(unittest.TestCase):
         assert torch.all((predictions[:,-1] == EOS) | (predictions[:,-1] == PAD)), f"Got {predictions[:,-1]}. Expected {EOS} or {PAD}."
 
     def test_decode_rec_1(self):
-        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, 1.0)[0]
+        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.encoder_states, self.targets, 1.0)[0]
         self._test_decode(predictions)
 
     def test_decode_trn_1(self):
@@ -111,7 +130,7 @@ class TestApproximators(unittest.TestCase):
         self._test_decode(predictions)
 
     def test_decode_rec_2(self):
-        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, None, 0.0)[0]
+        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.encoder_states, None, 0.0)[0]
         self._test_decode(predictions)
 
     def test_decode_trn_2(self):
@@ -119,7 +138,7 @@ class TestApproximators(unittest.TestCase):
         self._test_decode(predictions)
 
     def test_decode_rec_3(self):
-        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.targets, 0.5)[0]
+        predictions = self.rec.decode(self.encoder_outputs, self.encoder_hidden, self.encoder_states, self.targets, 0.5)[0]
         self._test_decode(predictions)
 
     def test_decode_trn_3(self):

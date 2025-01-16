@@ -57,7 +57,7 @@ from pprint import pformat
 import random
 from statistics import mean
 import sys
-from typing import Callable, Generator, Literal, Optional, Protocol, Self
+from typing import Callable, Generator, Literal, Optional, Protocol, Self  # pylint: disable=no-name-in-module
 import warnings
 
 import numpy as np
@@ -87,13 +87,23 @@ from src.utils import (
 # pylint: enable=wrong-import-position
 
 
-# TODO: improve upon this solution
+# Strange issues with the SDP backend.
 BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
 
 PAD = -10000.0
 BOS = -10001.0
 EOS = -10002.0
+
+
+# Should we be returning predictions with a length equal to the predicted length?
+# Or should we return predictions with a length of self.max_length and only trim them in self.translate?
+# These variables control the behavior of the model with regard to these factors.
+# For now, I'll prevent trimming in the training/evaluation loop because the model can still learn
+# from timings in the ground truth flow that are past the predicted length.
+TRIM_IN_TR = False
+TRIM_IN_VL = False
+TRIM_MINIMUM_LENGTH = 1
 
 
 def pad(shape: tuple[int]) -> Tensor:
@@ -210,7 +220,7 @@ class ApproximatorLossFn(nn.Module):
         self.timing_weight = timing_weight
         self.length_weight = length_weight
 
-    def forward(self, y_pred: Tensor, y_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
@@ -220,12 +230,12 @@ class ApproximatorLossFn(nn.Module):
         NUM = len(y_pred)
 
         # Compute the length loss, not considering the length added by BOS and EOS tokens.
-        lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
-        y_tr = lengths[:, 0] - 2
-        y_pr = lengths[:, 1] - 2
+        y_tr = torch.tensor([len(y) for y in y_true], dtype=torch.float32, device=length_pred.device) - 2
+        y_pr = length_pred
         length_loss = F.mse_loss(y_pr, y_tr)
 
         # Compute the timing loss over the shorter of the two sequences, excluding BOS and EOS tokens.
+        lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
         minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
         y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
         y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
@@ -276,13 +286,16 @@ class Approximator(Protocol):
     def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor] | Tensor:
         ...
 
+    def predict_length(self, encoder_outputs: Tensor) -> Tensor:
+        ...
+
     def decode(self, encoder_outputs: Tensor, targets: Optional[Tensor], *args, **kwds) -> Tensor:
         ...
 
     def project(self, output: Tensor) -> Tensor:
         ...
 
-    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, *args, **kwds) -> Tensor:
+    def forward(self, inputs: Tensor, targets: Optional[Tensor] = None, *args, **kwds) -> tuple[Tensor, Tensor]:  # pylint: disable=keyword-arg-before-vararg
         ...
 
     def translate(self, inputs: Tensor) -> Tensor:
@@ -291,6 +304,31 @@ class Approximator(Protocol):
     @classmethod
     def from_pretrained(cls, file: os.PathLike, **kwds) -> Approximator:
         ...
+
+
+class LengthPredictionHead(nn.Module):
+
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net.forward(x).squeeze(1)
+
+    @staticmethod
+    def trim_predictions_(predictions: Tensor, lengths: Tensor, min_length: int = 0) -> Tensor:
+        # Set the EOS token right after the predicted output lengths and PAD after that.
+        # TODO: vectorize using torch instead of for-loop.
+        # TODO: this will cause an index error if the predictions are literally too short (unlikely to occur).
+        for i, l in enumerate(lengths):
+            predictions[i, max(l, min_length) + 1 ] = EOS
+            predictions[i, max(l, min_length) + 2:] = PAD
+        return predictions
 
 
 class Attention(nn.Module):
@@ -340,7 +378,8 @@ class RecurrentApproximator(nn.Module):
 
         super().__init__()
         self.max_length = max_length
-        cell = RecurrentApproximator.CELL[cell]
+        self.cell = cell
+        cell = RecurrentApproximator.CELL[self.cell]
         self.embedding_src = nn.Linear(1, hidden_size)
         self.embedding_tgt = nn.Linear(1, hidden_size)
         self.dropout = nn.Dropout(0.1)
@@ -360,12 +399,11 @@ class RecurrentApproximator(nn.Module):
             **kwds,
         )
         self.head = nn.Linear(hidden_size, 1)
+        self.length_prediction_head = LengthPredictionHead(hidden_size, hidden_size)
 
     def embed_src(self, inputs: Tensor) -> Tensor:
         if inputs.dim() != 2:
             raise ShapeError((inputs.shape), ("B", "T"))
-        ApproximatorCollateFn.verify_has_bos(inputs)
-        ApproximatorCollateFn.verify_has_eos(inputs)
         x = inputs.unsqueeze(2)
         x = self.embedding_src.forward(x)
         x = self.dropout.forward(x)
@@ -389,14 +427,21 @@ class RecurrentApproximator(nn.Module):
             encoder_outputs, encoder_hidden = self.encoder.forward(embeddings)
         return encoder_outputs, encoder_hidden, encoder_states
 
+    def predict_length(self, encoder_outputs: Tensor) -> Tensor:
+        if encoder_outputs.dim() != 3:
+            raise ShapeError((encoder_outputs.shape), ("B", "L", "H"))
+        x = self.length_prediction_head.forward(encoder_outputs.mean(1))
+        return x
+
     def decode(
         self,
         encoder_outputs: Tensor,
         encoder_hidden: Tensor,
-        encoder_states: Optional[Tensor] = None,
+        encoder_states: Optional[Tensor],
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
+        max_length: Optional[int] = None,
     ) -> Tensor:
         if encoder_outputs.dim() != 3:
             raise ShapeError((encoder_outputs.shape), ("B", "L", "H"))
@@ -415,10 +460,12 @@ class RecurrentApproximator(nn.Module):
         else:
             use_teacher_forcing = False
 
+        max_length = self.max_length if max_length is None else max_length
+
         B = encoder_outputs.size(0)
-        T_src = encoder_outputs.size(1)
+        T_src = encoder_outputs.size(1)  # pylint: disable=unused-variable
         T_tgt = targets.size(1) if targets is not None else None
-        T_max = self.max_length
+        T_max = max_length
         D = encoder_outputs.device
 
         decoder_hidden = encoder_hidden                                           # (L, B, H)
@@ -427,7 +474,7 @@ class RecurrentApproximator(nn.Module):
         decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
 
         finished = torch.zeros((B,), dtype=torch.bool, device=D)
-        for i in range(1, self.max_length):
+        for i in range(1, max_length):
 
             embeddings = self.embed_tgt(decoder_input)                    # (B, 1, H)
             final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
@@ -473,13 +520,16 @@ class RecurrentApproximator(nn.Module):
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
-    ) -> Tensor:
-        # if targets is not None:
-        #     ApproximatorCollateFn.verify_has_bos(targets)
-        #     ApproximatorCollateFn.verify_has_eos(targets)
+        trim_predictions: bool = False,
+    ) -> tuple[Tensor, Tensor]:
 
         embeddings = self.embed_src(inputs)                                        # (B, T, H)
         encoder_outputs, encoder_hidden, encoder_states = self.encode(embeddings)  # (B, T, H), (L, B, H), (L, B, H)
+
+        output_lengths_f = self.predict_length(encoder_outputs)                    # (B,)
+        output_lengths_i = output_lengths_f.round().to(torch.int64)                # (B,)
+        max_length = output_lengths_i.max().item() if trim_predictions else None
+
         predictions = self.decode(
             encoder_outputs,
             encoder_hidden,
@@ -487,15 +537,19 @@ class RecurrentApproximator(nn.Module):
             targets,
             teacher_force_ratio,
             teacher_force_batch_mode,
+            max_length,
         )[0]
-        return predictions
+        if trim_predictions:
+            predictions = LengthPredictionHead.trim_predictions_(predictions, output_lengths_i, TRIM_MINIMUM_LENGTH)
+
+        return predictions, output_lengths_f
 
     def translate(self, inputs: Tensor) -> Tensor:
         is_training = self.training
         if is_training:
             self.eval()
         with torch.no_grad():
-            targets = self.forward(inputs, None, 0.0)
+            targets = self.forward(inputs, None, 0.0, False, True)[0]
         if is_training:
             self.train()
         return targets
@@ -565,6 +619,7 @@ class TransformerApproximator(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
         self.head = nn.Linear(hidden_size, 1)
+        self.length_prediction_head = LengthPredictionHead(hidden_size, hidden_size)
 
     def embed_src(self, inputs: Tensor) -> Tensor:
         if inputs.dim() != 2:
@@ -592,12 +647,19 @@ class TransformerApproximator(nn.Module):
         x = self.encoder.forward(embeddings, mask, padding_mask, is_causal=False)
         return x
 
+    def predict_length(self, encoder_outputs: Tensor) -> Tensor:
+        if encoder_outputs.dim() != 3:
+            raise ShapeError((encoder_outputs.shape), ("B", "L", "H"))
+        x = self.length_prediction_head.forward(encoder_outputs.mean(1))
+        return x
+
     def decode(
         self,
         encoder_outputs: Tensor,
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
+        max_length: Optional[int] = None,
     ) -> Tensor:
 
         if encoder_outputs.dim() != 3:
@@ -605,10 +667,12 @@ class TransformerApproximator(nn.Module):
         if targets is not None and targets.dim() != 2:
             raise ShapeError((targets.shape), ("B", "T - 1"))
 
+        max_length = self.max_length if max_length is None else max_length
+
         B = encoder_outputs.size(0)
-        T_src = encoder_outputs.size(1)
+        T_src = encoder_outputs.size(1)  # pylint: disable=unused-variable
         T_tgt = targets.size(1) if targets is not None else None
-        T_max = self.max_length
+        T_max = max_length
         D = encoder_outputs.device
 
         if targets is not None:
@@ -636,7 +700,7 @@ class TransformerApproximator(nn.Module):
         decoder_input = bos((B, 1)).to(D)                                         # (B, 1)
         finished = torch.zeros((B,), dtype=torch.bool, device=D)                  # (B,)
 
-        for i in range(1, self.max_length):
+        for i in range(1, max_length):
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(i, D, torch.bool)  # (i, i)
             tgt_padding_mask = (decoder_input == PAD).to(D)
             decoder_embeddings = self.embed_tgt(decoder_input)                           # (B, i, H)
@@ -673,10 +737,8 @@ class TransformerApproximator(nn.Module):
         targets: Optional[Tensor] = None,
         teacher_force_ratio: float = 1.0,
         teacher_force_batch_mode: bool = True,
-    ) -> Tensor:
-        # if targets is not None:
-        #     ApproximatorCollateFn.verify_has_bos(targets)
-        #     ApproximatorCollateFn.verify_has_eos(targets)
+        trim_predictions: bool = False,
+    ) -> tuple[Tensor, Tensor]:
 
         src_mask = torch.zeros(
             (inputs.size(1), inputs.size(1)), dtype=torch.bool, device=inputs.device
@@ -685,15 +747,29 @@ class TransformerApproximator(nn.Module):
 
         embeddings = self.embed_src(inputs)
         encoder_outputs = self.encode(embeddings, src_mask, src_padding_mask)
-        predictions = self.decode(encoder_outputs, targets, teacher_force_ratio, teacher_force_batch_mode)
-        return predictions
+
+        output_lengths_f = self.predict_length(encoder_outputs)
+        output_lengths_i = output_lengths_f.round().to(torch.int64)
+        max_length = output_lengths_i.max().item() if trim_predictions else None
+
+        predictions = self.decode(
+            encoder_outputs,
+            targets,
+            teacher_force_ratio,
+            teacher_force_batch_mode,
+            max_length,
+        )
+        if trim_predictions:
+            predictions = LengthPredictionHead.trim_predictions_(predictions, output_lengths_i, TRIM_MINIMUM_LENGTH)
+
+        return predictions, output_lengths_f
 
     def translate(self, inputs: Tensor) -> Tensor:
         is_training = self.training
         if is_training:
             self.eval()
         with torch.no_grad():
-            targets = self.forward(inputs, None, 0.0)
+            targets = self.forward(inputs, None, 0.0, False, True)[0]
         if is_training:
             self.train()
         return targets
@@ -727,26 +803,33 @@ class ApproximatorTrainer(Trainer):
     def create_teacher_ratio_scheduler(self) -> TeacherRatioScheduler:
         return TeacherRatioScheduler(self.args.epochs, self.args.teacher_ratio_start, self.args.teacher_ratio_end)
 
-    def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor]:
+    def forward(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Optional[Tensor], Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
-        return (y_pred,)
+        y_pred, length_pred = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio, trim_predictions=TRIM_IN_TR)
+        return (y_pred, None, length_pred)
 
-    def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
+    def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred_tch = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
-        y_pred_gen = self.model.forward(x, y, teacher_force_ratio=0.0)
-        return (y_pred_tch, y_pred_gen)
+        y_pred_tch, _ = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio, trim_predictions=TRIM_IN_VL)
+        y_pred_gen, length_pred = self.model.forward(x, y, teacher_force_ratio=0.0, trim_predictions=TRIM_IN_TR)
+        return (y_pred_tch, y_pred_gen, length_pred)
 
-    def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor]) -> Tensor:
+    def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Optional[Tensor], Tensor]) -> tuple[Tensor, dict[str, float]]:
         y: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
-        loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y)
+        length_pred: Tensor = outputs[2]
+        loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y, length_pred)
         return loss, {"length_loss": length_loss.item(), "timing_loss": timing_loss.item()}
 
-    def compute_metrics(self, y_true: list[Tensor], y_pred_tch: list[Tensor], y_pred_gen: list[Tensor]) -> dict[str, float]:
+    def compute_metrics(  # pylint: disable=arguments-differ
+        self,
+        y_true: list[Tensor],
+        y_pred_tch: list[Tensor],
+        y_pred_gen: list[Tensor],
+        length_pred: list[Tensor],
+    ) -> dict[str, float]:
         if not len(y_true) == len(y_pred_tch) == len(y_pred_gen):
             raise ValueError(f"Lengths of {y_true=}, {y_pred_tch=}, and {y_pred_gen=} do not match.")
 
@@ -759,14 +842,15 @@ class ApproximatorTrainer(Trainer):
 
         metrics = {}
         for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
+
             # Compute the length metrics, not considering the length added by BOS and EOS tokens.
-            lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
-            y_tr = lengths[:, 0] - 2
-            y_pr = lengths[:, 1] - 2
+            y_tr = torch.tensor([len(y) for y in y_true], dtype=torch.float32) - 2
+            y_pr = torch.tensor(length_pred)
             m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
             metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in MET})
 
             # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
+            lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
             minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
             y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
             y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
@@ -781,9 +865,10 @@ class ApproximatorTrainer(Trainer):
 
     def get_compute_metrics_inputs(self, batch: tuple, outputs: tuple) -> dict[str, list[Tensor]]:
         return {
-            "y_true": [t for t in batch[1]],
-            "y_pred_tch": [t for t in outputs[0]],
-            "y_pred_gen": [t for t in outputs[1]],
+            "y_true": [t for t in batch[1]],         # pylint: disable=unnecessary-comprehension
+            "y_pred_tch": [t for t in outputs[0]],   # pylint: disable=unnecessary-comprehension
+            "y_pred_gen": [t for t in outputs[1]],   # pylint: disable=unnecessary-comprehension
+            "length_pred": [t for t in outputs[2]],  # pylint: disable=unnecessary-comprehension
         }
 
 
@@ -825,7 +910,7 @@ class OutputHelper:
 
 def main() -> None:
 
-    global BACKEND
+    # global BACKEND
 
     parser = TrainerArgumentParser()
     parser.add_argument("--max_length", type=int, default=64, help=".")
