@@ -897,6 +897,9 @@ class OutputHelper:
         max_length: int,
         teacher_ratio_start: float,
         teacher_ratio_end: float,
+        timing_weight: float,
+        length_weight: float,
+        distrib_weight: float,
     ) -> None:
         self.root = root
         self.pair_mode = pair_mode
@@ -905,6 +908,9 @@ class OutputHelper:
         self.max_length = max_length
         self.teacher_ratio_start = teacher_ratio_start
         self.teacher_ratio_end = teacher_ratio_end
+        self.timing_weight = timing_weight
+        self.length_weight = length_weight
+        self.distrib_weight = distrib_weight
 
     @property
     def path(self) -> Path:
@@ -915,6 +921,9 @@ class OutputHelper:
             f"arch_config--{self.arch_config}",
             f"teacher_ratio_start--{self.teacher_ratio_start}",
             f"teacher_ratio_end--{self.teacher_ratio_end}",
+            f"timing_weight--{self.timing_weight}",
+            f"length_weight--{self.length_weight}",
+            f"distrib_weight--{self.distrib_weight}",
         ]
         return Path(self.root).joinpath(*args) / "results"
 
@@ -934,6 +943,9 @@ def main() -> None:
     parser.add_argument("--pair_mode", type=str, default="single_hops", choices=["single_hops", "hops", "chains"], help=".")
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
     parser.add_argument("--vl_num_samples", type=int, default=sys.maxsize, help=".")
+    parser.add_argument("--timing_weight", type=float, default=1.0, help=".")
+    parser.add_argument("--length_weight", type=float, default=1.0, help=".")
+    parser.add_argument("--distrib_weight", type=float, default=1.0, help=".")
     args = parser.parse_args()
 
     print(f"Command Line Arguments:\n{pformat(args.__dict__)}")
@@ -947,6 +959,9 @@ def main() -> None:
         args.max_length,
         args.teacher_ratio_start,
         args.teacher_ratio_end,
+        args.timing_weight,
+        args.length_weight,
+        args.distrib_weight,
     )
     print(f"{oh.path=}")
 
@@ -991,7 +1006,11 @@ def main() -> None:
     print("-" * 80)
 
     collate_fn = ApproximatorCollateFn(max_length=args.max_length)
-    loss_fn = ApproximatorLossFn(timing_weight=1.0, length_weight=1.0)
+    loss_fn = ApproximatorLossFn(
+        timing_weight=args.timing_weight,
+        length_weight=args.length_weight,
+        distrib_weight=args.distrib_weight,
+    )
     trainer_args = TrainerArgs(
         outdir=oh.path,
         device=args.device,
