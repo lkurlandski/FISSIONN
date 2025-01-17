@@ -60,6 +60,7 @@ import sys
 from typing import Callable, Generator, Literal, Optional, Protocol, Self  # pylint: disable=no-name-in-module
 import warnings
 
+from geomloss import SamplesLoss
 import numpy as np
 from scipy import stats
 from sklearn.model_selection import train_test_split
@@ -216,10 +217,16 @@ class ApproximatorCollateFn:
 
 class ApproximatorLossFn(nn.Module):
 
-    def __init__(self, timing_weight: float = 1.0, length_weight: float = 1.0) -> None:
+    def __init__(
+        self,
+        timing_weight: float = 1.0,
+        length_weight: float = 1.0,
+        distrib_weight: float = 1.0,
+    ) -> None:
         super().__init__()
         self.timing_weight = timing_weight
         self.length_weight = length_weight
+        self.distrib_weight = distrib_weight
 
     def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor, length_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
@@ -240,8 +247,13 @@ class ApproximatorLossFn(nn.Module):
         y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
         timing_loss = F.mse_loss(y_pr, y_tr)
 
+        # Compute the distribution loss.
+        distrib_loss = SamplesLoss()(y_tr, y_pr)
+
         # Combine the timing and length losses.
-        weighted_loss = self.timing_weight * timing_loss + self.length_weight * length_loss
+        weighted_loss = self.timing_weight * timing_loss \
+                      + self.length_weight * length_loss \
+                      + self.distrib_weight * distrib_loss
         return weighted_loss, length_loss, timing_loss
 
     @staticmethod
