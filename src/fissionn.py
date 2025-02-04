@@ -28,7 +28,7 @@ import torch
 from torch import nn, Tensor, BoolTensor, FloatTensor
 from torch.distributions import Laplace, Uniform
 from torch.nn import functional as F, CrossEntropyLoss, L1Loss
-from torch.optim import Optimizer, Adam
+from torch.optim.lr_scheduler import ExponentialLR, LRScheduler, SequentialLR, LinearLR, ConstantLR
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -316,8 +316,12 @@ class FissionnTrainer(Trainer):
     loss_fn: FinnLossFn
     tr_metric_keys = ("tr_loss", "tr_enc_loss", "tr_dec_loss", "tr_time",)
 
-    def create_scheduler(self) -> None:
-        return None
+    def create_scheduler(self) -> Optional[LRScheduler]:
+        warmup_scheduler = LinearLR(self.optimizer, start_factor=0.01, total_iters=10)
+        constant_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=10)
+        decay_scheduler = ExponentialLR(self.optimizer, gamma=0.85)
+        scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, constant_scheduler, decay_scheduler], milestones=[10, 20])
+        return scheduler
 
     def create_stopper(self) -> None:
         return None
