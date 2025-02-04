@@ -53,6 +53,7 @@ import math
 import multiprocessing as mp
 import os
 from pathlib import Path
+import pickle
 from pprint import pformat
 import random
 from statistics import mean
@@ -66,7 +67,7 @@ from scipy import stats
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
-from torch import nn, Tensor, BoolTensor
+from torch import nn, Tensor, BoolTensor, IntTensor
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
@@ -232,28 +233,54 @@ class ApproximatorLossFn(nn.Module):
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
+        NUM = len(y_pred)
+
+        # List of inhomogeneous predictions and ground truths without PAD tokens.
         y_pred = remove_padding(y_pred)
         y_true = remove_padding(y_true)
 
-        NUM = len(y_pred)
+        # Length statistics about the predictions and ground truths.
+        lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
+        minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
+
+        # List of inhomogeneous predictions and ground truths without BOS and EOS tokens,
+        # trimmed such that corresponding sequences have the same length.
+        y_pred_trim = [y_pred[i][1:l-1] for i, l in enumerate(minimum)]
+        y_true_trim = [y_true[i][1:l-1] for i, l in enumerate(minimum)]
+
+        # Predictions and ground truths trimmed such that the corresponding sequences have the same length,
+        # then padded into a homogeneous shape.
+        y_pred_homo = pad_sequence(y_true_trim, batch_first=True, padding_value=PAD)
+        y_true_homo = pad_sequence(y_pred_trim, batch_first=True, padding_value=PAD)
 
         # Compute the length loss, not considering the length added by BOS and EOS tokens.
         length_loss = F.mse_loss(length_pred, length_true)
 
         # Compute the timing loss over the shorter of the two sequences, excluding BOS and EOS tokens.
-        lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
-        minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
-        y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
-        y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
-        timing_loss = F.mse_loss(y_pr, y_tr)
+        timing_loss = F.mse_loss(torch.cat(y_pred_trim), torch.cat(y_true_trim))
 
         # Compute the distribution loss.
-        distrib_loss = SamplesLoss()(y_tr, y_pr)
+        # Note the expansion of the inputs along the last dimension in accordance with the underlying mathematics.
+        # Note also that we need to take the mean along the batch dimension.
+        mask = torch.zeros_like(y_pred_homo)
+        for i, length in enumerate(minimum):
+            mask[i, :length] = 1.0 / length
+        distrib_loss = SamplesLoss(
+            loss="sinkhorn",
+            backend="online",
+        )(
+            mask,
+            y_pred_homo.unsqueeze(2),
+            mask,
+            y_true_homo.unsqueeze(2),
+        ).mean()
+        # distrib_loss = torch.tensor(0.0)
 
         # Combine the timing and length losses.
         weighted_loss = self.timing_weight * timing_loss \
                       + self.length_weight * length_loss \
                       + self.distrib_weight * distrib_loss
+
         return weighted_loss, length_loss, timing_loss
 
     @staticmethod
@@ -317,6 +344,14 @@ class Approximator(Protocol):
         ...
 
 
+def from_pretrained(file: str, **kwds) -> Approximator:
+    if "transformer" in file:
+        return TransformerApproximator.from_pretrained(file, **kwds)
+    if any(s in file for s in ("rnn", "lstm", "gru")):
+        return RecurrentApproximator.from_pretrained(file, **kwds)
+    return torch.load(file, **kwds)
+
+
 class LengthPredictionHead(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.1) -> None:
@@ -334,11 +369,23 @@ class LengthPredictionHead(nn.Module):
     @staticmethod
     def trim_predictions_(predictions: Tensor, lengths: Tensor, min_length: int = 0) -> Tensor:
         # Set the EOS token right after the predicted output lengths and PAD after that.
+        # Also accounts for the possibility that EOS occurs before the predicted length.
         # TODO: vectorize using torch instead of for-loop.
-        # TODO: this will cause an index error if the predictions are literally too short (unlikely to occur).
-        for i, l in enumerate(lengths):
-            predictions[i, max(l, min_length) + 1 ] = EOS
-            predictions[i, max(l, min_length) + 2:] = PAD
+
+        B = predictions.shape[0]
+
+        for i in range(B):
+            p = predictions[i]
+            l = int(lengths[i].item())
+
+            if len(eos_positions := torch.nonzero(p == EOS, as_tuple=False)):
+                if not torch.all(p[eos_positions[0] + 1:] == PAD):
+                    raise RuntimeError(f"Non-padding tokens found after EOS token: {p[eos_positions[0] + 1:].tolist()}")
+
+            if l <= len(p):
+                predictions[i, max(l, min_length) + 1 ] = EOS
+                predictions[i, max(l, min_length) + 2:] = PAD
+
         return predictions
 
 
@@ -987,6 +1034,8 @@ def main() -> None:
     lengths = [(len(x), len(y)) for x, y in tr_dataset.dataset.ipd_pairs]
     lengths = np.expand_dims(np.array(lengths).flatten(), 1)
     length_scaler = StandardScaler().fit(lengths, 1)
+    with open("./cache/length_scaler.pkl", "wb") as fp:
+        pickle.dump(length_scaler, fp)
     print(f"Length Scaler: {length_scaler}")
 
     if args.arch == "transformer":
