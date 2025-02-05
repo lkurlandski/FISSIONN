@@ -1,10 +1,11 @@
 """
-
+Loading data and the like.
 """
+
 from collections import namedtuple
 from dataclasses import dataclass
 import pickle
-from typing import Generator, Optional, TypeAlias
+from typing import Generator, Optional, TypeAlias  # pylint: disable=no-name-in-module
 
 import numpy as np
 
@@ -33,7 +34,7 @@ def load_data(file: str = "/home/lk3591/Documents/code/TrafficAnal/data/syntheti
     with open(file, "rb") as fp:
         all_data = pickle.load(fp)
 
-    IP_info = all_data['IPs']   # extra src. & dst. IP info available for each stream
+    IP_info = all_data['IPs']   # extra src. & dst. IP info available for each stream  # pylint: disable=unused-variable
     data = all_data['data']     # stream metadata organized by sample and hosts (per sample)
 
     # list of all sample idx
@@ -41,6 +42,9 @@ def load_data(file: str = "/home/lk3591/Documents/code/TrafficAnal/data/syntheti
 
     # fill with lists of correlated samples
     all_streams = []
+
+    attacker_ID = None
+    target_ID   = None
 
     # each 'sample' contains a variable number of hosts (between 3 and 6 I believe)
     for s_idx in sample_IDs:
@@ -54,7 +58,7 @@ def load_data(file: str = "/home/lk3591/Documents/code/TrafficAnal/data/syntheti
 
         # the stepping stone hosts are everything in-between
         # these hosts should each contain two streams
-        steppingstone_IDs = list(filter(lambda x: x not in [attacker_ID, target_ID], host_IDs))
+        steppingstone_IDs = list(filter(lambda x: x not in [attacker_ID, target_ID], host_IDs))  # pylint: disable=unused-variable
 
         # loop through each host, process stream metadata into vectors, and add to list
         correlated_streams = []

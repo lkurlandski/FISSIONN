@@ -45,7 +45,7 @@ max_length: 256
 """
 
 from argparse import ArgumentParser
-from itertools import batched
+from itertools import batched  # pylint: disable=no-name-in-module
 import math
 import multiprocessing as mp
 from pprint import pformat, pprint

@@ -48,7 +48,7 @@ with sdpa_kernel(SDPBackend.MATH):
 from __future__ import annotations
 from collections.abc import Iterable
 from collections import defaultdict
-from itertools import batched, chain, combinations
+from itertools import combinations
 import math
 import multiprocessing as mp
 import os

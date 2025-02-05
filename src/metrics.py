@@ -41,18 +41,17 @@ def regression_report(y_true: np.ndarray, y_pred: np.ndarray, errors: Literal["r
     def f(func: Callable[[np.ndarray, np.ndarray], float]) -> float:
         try:
             return func(y_true, y_pred)
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             if errors == "raise":
                 raise e
-            elif errors == "warn":
+            if errors == "warn":
                 warnings.warn(str(e))
                 return np.nan
-            elif errors == "nan":
+            if errors == "nan":
                 return np.nan
-            elif errors == "ignore":
+            if errors == "ignore":
                 return SENTINAL
-            else:
-                raise ValueError(f"Invalid value for 'errors': {errors}")
+            raise ValueError(f"Invalid value for 'errors': {errors}") from e
 
     d = {
         "r2": r2_score,

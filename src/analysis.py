@@ -6,7 +6,7 @@ from argparse import ArgumentParser
 import json
 from pathlib import Path
 import os
-from typing import Self
+from typing import Self  # pylint: disable=no-name-in-module
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -82,7 +82,7 @@ class Analyzer:
 
     def plot(self, keys_for_main: tuple[str] = tuple()) -> Self:
 
-        for k, v in self.data.items():
+        for k, v in self.data.items():  # pylint: disable=unused-variable
             if k == "epoch":
                 continue
             fig, _ = self._plot(k)
