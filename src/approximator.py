@@ -271,6 +271,8 @@ class ApproximatorLossFn(nn.Module):
         return weighted_loss, length_loss, timing_loss
 
     def distribution_loss(self, y_pred_homo: Tensor, y_true_homo: Tensor, minimum: Tensor, batch_size: int = 32) -> Tensor:
+        if self.distrib_weight == 0.0:
+            return torch.tensor(0.0, device=y_pred_homo.device)
         # We do this in batches to prevent CUDA OOM errors.
         # This is sufficiently fast with the default "tensorized" backend (no need for specialized engines).
         # We also need to re-engage the state of gradients, as geomloss seems to automatically enable them.
