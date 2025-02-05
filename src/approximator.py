@@ -428,6 +428,7 @@ class RecurrentApproximator(nn.Module):
         hidden_size: int,
         num_layers: int,
         cell: Literal["rnn", "lstm", "gru"] = "rnn",
+        use_attention: bool = False,
         **kwds,
     ) -> None:
         if kwds.get("bidirectional", False):
@@ -440,7 +441,7 @@ class RecurrentApproximator(nn.Module):
         self.embedding_src = nn.Linear(1, hidden_size)
         self.embedding_tgt = nn.Linear(1, hidden_size)
         self.dropout = nn.Dropout(0.1)
-        self.attention = Attention(hidden_size)
+        self.attention = Attention(hidden_size) if use_attention else None
         self.encoder: nn.RNN | nn.LSTM | nn.GRU = cell(
             hidden_size,
             hidden_size,
@@ -449,7 +450,7 @@ class RecurrentApproximator(nn.Module):
             **kwds,
         )
         self.decoder: nn.RNN | nn.LSTM | nn.GRU = cell(
-            2 * hidden_size,
+            2 * hidden_size if use_attention else hidden_size,
             hidden_size,
             num_layers,
             batch_first=True,
@@ -536,8 +537,11 @@ class RecurrentApproximator(nn.Module):
             embeddings = self.embed_tgt(decoder_input)                    # (B, 1, H)
             final_hidden_state = decoder_hidden[-1:,:,:].transpose(0, 1)  # (B, 1, H)
 
-            context, _ = self.attention.forward(final_hidden_state, encoder_outputs)                   # (B, 1, H), (B, 1, 2 * H)
-            decoder_embeddings = torch.cat((embeddings, context), dim=2)                               # (B, 1, 2 * H)
+            if self.attention is not None:
+                context, _ = self.attention.forward(final_hidden_state, encoder_outputs)                   # (B, 1, H), (B, 1, 2 * H)
+                decoder_embeddings = torch.cat((embeddings, context), dim=2)                               # (B, 1, 2 * H)
+            else:
+                decoder_embeddings = embeddings                                                            # (B, 1, H)
             if isinstance(self.decoder, nn.LSTM):
                 decoder_output, (decoder_hidden, decoder_states) = self.decoder.forward(decoder_embeddings, (decoder_hidden, decoder_states))  # (B, 1, H), (L, B, H), (L, B, H)
             else:
@@ -981,7 +985,7 @@ def main() -> None:
     parser = TrainerArgumentParser()
     parser.add_argument("--max_length", type=int, default=64, help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "rnn", "lstm", "gru"], help=".")
+    parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "rnn", "lstm", "gru", "rnn-att", "lstm-att", "gru-att"], help=".")
     parser.add_argument("--arch_config", type=str, default="puny", choices=["puny", "tiny", "small", "medium", "large", "huge"], help=".")
     parser.add_argument("--pair_mode", type=str, default="single_hops", choices=["single_hops", "hops", "chains"], help=".")
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
@@ -1041,7 +1045,7 @@ def main() -> None:
             ...
             # BACKEND = SDPBackend.MATH
     else:
-        config = {"max_length": args.max_length, "cell": args.arch} | getattr(RecurrentApproximator, args.arch_config.upper())
+        config = {"max_length": args.max_length, "cell": args.arch.split("-")[0], "use_attention": "att" in args.arch} | getattr(RecurrentApproximator, args.arch_config.upper())
         model = RecurrentApproximator(**config)
 
     print(f"Model:\n{model}")
