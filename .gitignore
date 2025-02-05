@@ -166,6 +166,7 @@ cython_debug/
 cache/*
 config/*
 data/*
+export/*
 logs/*
 notebooks/*
 output/*
