@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer, AdamW
-from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
+from torch.optim.lr_scheduler import ExponentialLR, LRScheduler, SequentialLR, ConstantLR, LinearLR, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, IterableDataset, Subset
 from tqdm import tqdm
 
@@ -114,6 +114,36 @@ class TeacherRatioScheduler:
     @property
     def ratio(self) -> float:
         return self.ratios[self.idx]
+
+
+def get_lr_scheduler(optimizer: Optimizer, epochs: int) -> LRScheduler:
+    """
+    Creates a pre-configured learning rate scheduler based on the number of epochs.
+    """
+
+    if epochs == 10:
+        return SequentialLR(
+            optimizer,
+            [
+                LinearLR(optimizer, start_factor=0.01, total_iters=2),
+                ConstantLR(optimizer, factor=1.0, total_iters=3),
+                ExponentialLR(optimizer, gamma=0.60),
+            ],
+            [2, 5],
+        )
+
+    if epochs == 20:
+        return SequentialLR(
+            optimizer,
+            [
+                LinearLR(optimizer, start_factor=0.01, total_iters=5),
+                ConstantLR(optimizer, factor=1.0, total_iters=5),
+                ExponentialLR(optimizer, gamma=0.60),
+            ],
+            [5, 10],
+        )
+
+    raise ValueError(f"No scheduler configured for the given number of epochs: {epochs}.")
 
 
 def find_executable_batch_size(
