@@ -48,7 +48,7 @@ with sdpa_kernel(SDPBackend.MATH):
 from __future__ import annotations
 from collections.abc import Iterable
 from collections import defaultdict
-from itertools import chain, combinations
+from itertools import batched, chain, combinations
 import math
 import multiprocessing as mp
 import os
@@ -259,22 +259,21 @@ class ApproximatorLossFn(nn.Module):
         # Compute the timing loss over the shorter of the two sequences, excluding BOS and EOS tokens.
         timing_loss = F.mse_loss(torch.cat(y_pred_trim), torch.cat(y_true_trim))
 
-        # Compute the distribution loss.
-        # Note the expansion of the inputs along the last dimension in accordance with the underlying mathematics.
-        # Note also that we need to take the mean along the batch dimension.
+        # Compute the distribution loss. We do this in batches to prevent CUDA OOM errors, which is
+        # sufficiently fast with the default "tensorized" backend (no need for specialized engines).
         mask = torch.zeros_like(y_pred_homo)
         for i, length in enumerate(minimum):
             mask[i, :length] = 1.0 / length
-        distrib_loss = SamplesLoss(
-            loss="sinkhorn",
-            backend="online",
-        )(
-            mask,
-            y_pred_homo.unsqueeze(2),
-            mask,
-            y_true_homo.unsqueeze(2),
-        ).mean()
-        # distrib_loss = torch.tensor(0.0)
+
+        distrib_losses = []
+        batch_size = 32
+        for i in range(0, len(mask), batch_size):
+            m = mask[i:i+batch_size]
+            x = y_pred_homo[i:i+batch_size].unsqueeze(2)
+            y = y_true_homo[i:i+batch_size].unsqueeze(2)
+            l = SamplesLoss(loss="sinkhorn", backend="tensorized")(m, x, m, y)
+            distrib_losses.append(l)
+        distrib_loss = torch.cat(distrib_losses).mean()
 
         # Combine the timing and length losses.
         weighted_loss = self.timing_weight * timing_loss \
