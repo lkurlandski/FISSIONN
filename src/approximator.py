@@ -228,6 +228,7 @@ class ApproximatorLossFn(nn.Module):
         self.timing_weight = timing_weight
         self.length_weight = length_weight
         self.distrib_weight = distrib_weight
+        self.samples_loss_fn = SamplesLoss(loss="sinkhorn", backend="tensorized")
 
     def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor, length_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
@@ -250,8 +251,8 @@ class ApproximatorLossFn(nn.Module):
 
         # Predictions and ground truths trimmed such that the corresponding sequences have the same length,
         # then padded into a homogeneous shape.
-        y_pred_homo = pad_sequence(y_true_trim, batch_first=True, padding_value=PAD)
-        y_true_homo = pad_sequence(y_pred_trim, batch_first=True, padding_value=PAD)
+        y_pred_homo = pad_sequence(y_pred_trim, batch_first=True, padding_value=PAD)
+        y_true_homo = pad_sequence(y_true_trim, batch_first=True, padding_value=PAD)
 
         # Compute the length loss, not considering the length added by BOS and EOS tokens.
         length_loss = F.mse_loss(length_pred, length_true)
@@ -259,21 +260,8 @@ class ApproximatorLossFn(nn.Module):
         # Compute the timing loss over the shorter of the two sequences, excluding BOS and EOS tokens.
         timing_loss = F.mse_loss(torch.cat(y_pred_trim), torch.cat(y_true_trim))
 
-        # Compute the distribution loss. We do this in batches to prevent CUDA OOM errors, which is
-        # sufficiently fast with the default "tensorized" backend (no need for specialized engines).
-        mask = torch.zeros_like(y_pred_homo)
-        for i, length in enumerate(minimum):
-            mask[i, :length] = 1.0 / length
-
-        distrib_losses = []
-        batch_size = 32
-        for i in range(0, len(mask), batch_size):
-            m = mask[i:i+batch_size]
-            x = y_pred_homo[i:i+batch_size].unsqueeze(2)
-            y = y_true_homo[i:i+batch_size].unsqueeze(2)
-            l = SamplesLoss(loss="sinkhorn", backend="tensorized")(m, x, m, y)
-            distrib_losses.append(l)
-        distrib_loss = torch.cat(distrib_losses).mean()
+        # Compute the distribution loss.
+        distrib_loss = self.distribution_loss(y_pred_homo, y_true_homo, minimum)
 
         # Combine the timing and length losses.
         weighted_loss = self.timing_weight * timing_loss \
@@ -281,6 +269,29 @@ class ApproximatorLossFn(nn.Module):
                       + self.distrib_weight * distrib_loss
 
         return weighted_loss, length_loss, timing_loss
+
+    def distribution_loss(self, y_pred_homo: Tensor, y_true_homo: Tensor, minimum: Tensor, batch_size: int = 32) -> Tensor:
+        # We do this in batches to prevent CUDA OOM errors.
+        # This is sufficiently fast with the default "tensorized" backend (no need for specialized engines).
+        # We also need to re-engage the state of gradients, as geomloss seems to automatically enable them.
+        cur_grad_status = torch.is_grad_enabled()
+
+        mask = torch.zeros_like(y_pred_homo)
+        for i, length in enumerate(minimum):
+            mask[i, :length] = 1.0 / length
+
+        distrib_loss = torch.tensor(0.0, device=mask.device)
+        for i in range(0, len(mask), batch_size):
+            m = mask[i:i+batch_size]
+            x = y_pred_homo[i:i+batch_size].unsqueeze(2)
+            y = y_true_homo[i:i+batch_size].unsqueeze(2)
+            l: Tensor = self.samples_loss_fn(m, x, m, y)
+            distrib_loss += l.sum()
+        distrib_loss /= y_pred_homo.size(0)
+
+        torch.autograd.set_grad_enabled(cur_grad_status)
+
+        return distrib_loss
 
     @staticmethod
     def prepare_inputs_and_targets(
