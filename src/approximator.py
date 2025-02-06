@@ -67,7 +67,7 @@ from scipy import stats
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
-from torch import nn, Tensor, BoolTensor, IntTensor
+from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
@@ -180,17 +180,20 @@ class ApproximatorCollateFn:
     def __init__(self, max_length: int = sys.maxsize) -> None:
         self.max_length = max_length
 
-    def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
+    def __call__(self, batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor, Tensor]:
         x = []
         y = []
+        l = []
         for x_, y_ in batch:
             x_ = x_[0 : self.max_length - 2]
             y_ = y_[0 : self.max_length - 2]
+            l.append(len(y_))
             x.append(self.add_special_tokens(x_))
             y.append(self.add_special_tokens(y_))
         x = pad_sequence(x, batch_first=True, padding_value=PAD)
         y = pad_sequence(y, batch_first=True, padding_value=PAD)
-        return x, y
+        l = torch.tensor(l, dtype=torch.float32)
+        return x, y, l
 
     @staticmethod
     def add_special_tokens(z: Tensor) -> Tensor:
@@ -320,6 +323,30 @@ class ApproximatorLossFn(nn.Module):
         y_true_masked = y_true[mask]
 
         return y_pred_masked, y_true_masked
+
+
+class ApproximatorDiscriminator(nn.Module):
+
+    def __init__(self,  num_channels: int = 1,  conv_filters: int = 16, hidden_dim: int = 32) -> None:
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_channels=num_channels, out_channels=conv_filters, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            # nn.Conv1d(in_channels=conv_filters, out_channels=conv_filters, kernel_size=3, stride=1, padding=1),
+            # nn.ReLU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(conv_filters, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.conv(x)
+        x = torch.mean(x, dim=-1)
+        x = self.head(x)
+        return x
 
 
 class Approximator(Protocol):
@@ -890,14 +917,13 @@ class ApproximatorTrainer(Trainer):
         return (y_pred_tch, y_pred_gen, length_pred)
 
     def compute_loss(self, batch: tuple[Tensor, Tensor], outputs: tuple[Tensor, Optional[Tensor], Tensor]) -> tuple[Tensor, dict[str, float]]:
-        y: Tensor = batch[1].to(self.args.device)
+        y_true: Tensor = batch[1].to(self.args.device)
         y_pred: Tensor = outputs[0]
-        length = torch.tensor(
-            self.length_scaler.transform(np.expand_dims(np.array([len(y_) for y_ in y]), 1)),
-            dtype=torch.float32, device=y.device,
-        ).squeeze(1)
+        length_true = batch[2].unsqueeze(1).numpy(force=True)
+        length_true = self.length_scaler.transform(length_true)
+        length_true = torch.tensor(length_true, dtype=torch.float32, device=y_true.device).squeeze(1)
         length_pred: Tensor = outputs[2]
-        loss, length_loss, timing_loss, distrib_loss = self.loss_fn.forward(y_pred, y, length_pred, length)
+        loss, length_loss, timing_loss, distrib_loss = self.loss_fn.forward(y_pred, y_true, length_pred, length_true)
         losses = {
             "length_loss": length_loss.item(),
             "timing_loss": timing_loss.item(),
