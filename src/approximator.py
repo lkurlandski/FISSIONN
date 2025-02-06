@@ -230,7 +230,7 @@ class ApproximatorLossFn(nn.Module):
         self.distrib_weight = distrib_weight
         self.samples_loss_fn = SamplesLoss(loss="sinkhorn", backend="tensorized")
 
-    def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor, length_true: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, y_pred: Tensor, y_true: Tensor, length_pred: Tensor, length_true: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         if y_pred.dim() != 2 or y_true.dim() != 2 or y_pred.size(0) != y_true.size(0):
             raise ShapeError((y_pred.shape, y_true.shape), (("B", "T1"), ("B", "T2")))
 
@@ -268,7 +268,7 @@ class ApproximatorLossFn(nn.Module):
                       + self.length_weight * length_loss \
                       + self.distrib_weight * distrib_loss
 
-        return weighted_loss, length_loss, timing_loss
+        return weighted_loss, length_loss, timing_loss, distrib_loss
 
     def distribution_loss(self, y_pred_homo: Tensor, y_true_homo: Tensor, minimum: Tensor, batch_size: int = 32) -> Tensor:
         if self.distrib_weight == 0.0:
@@ -856,6 +856,9 @@ class ApproximatorTrainer(Trainer):
     collate_fn: ApproximatorCollateFn
     loss_fn: ApproximatorLossFn
 
+    # TODO: include the other keys so we can run analysis.
+    tr_metric_keys = ("tr_loss", "tr_time")
+
     def __init__(self, *args, length_scaler: StandardScaler, **kwds) -> None:
         super().__init__(*args, **kwds)
         self.length_scaler = length_scaler
@@ -882,7 +885,7 @@ class ApproximatorTrainer(Trainer):
     def forward_eval(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         x: Tensor = batch[0].to(self.args.device)
         y: Tensor = batch[1].to(self.args.device)
-        y_pred_tch, _ = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
+        y_pred_tch, length_pred = self.model.forward(x, y, teacher_force_ratio=self.teacher_ratio_scheduler.ratio)
         y_pred_gen, length_pred = self.model.forward(x, y, teacher_force_ratio=0.0)
         return (y_pred_tch, y_pred_gen, length_pred)
 
@@ -894,8 +897,13 @@ class ApproximatorTrainer(Trainer):
             dtype=torch.float32, device=y.device,
         ).squeeze(1)
         length_pred: Tensor = outputs[2]
-        loss, length_loss, timing_loss = self.loss_fn.forward(y_pred, y, length_pred, length)
-        return loss, {"length_loss": length_loss.item(), "timing_loss": timing_loss.item()}
+        loss, length_loss, timing_loss, distrib_loss = self.loss_fn.forward(y_pred, y, length_pred, length)
+        losses = {
+            "length_loss": length_loss.item(),
+            "timing_loss": timing_loss.item(),
+            "distrib_loss": distrib_loss.item(),
+        }
+        return loss, losses
 
     def compute_metrics(  # pylint: disable=arguments-differ
         self,

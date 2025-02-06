@@ -72,8 +72,10 @@ class Analyzer:
             raise ValueError("No data found in log file.")
 
         self.data = {key: [] for key in self.log[0].keys()}
-        for d in self.log:
+        for i, d in enumerate(self.log, 0):
             for k, v in d.items():
+                if k not in self.data:
+                    self.data[k] = [float("nan") for _ in range(i)]
                 self.data[k].append(v)
 
         self.data = {k: np.array(v) for k, v in self.data.items()}
