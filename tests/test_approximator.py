@@ -30,7 +30,9 @@ class TestApproximators(unittest.TestCase):
             max_length=self.max_length,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
-            cell="rnn"
+            cell="lstm",
+            use_attention=True,
+            bidirectional=True,
         )
         self.trn = TransformerApproximator(
             max_length=self.max_length,

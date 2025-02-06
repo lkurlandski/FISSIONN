@@ -469,10 +469,9 @@ class RecurrentApproximator(nn.Module):
         num_layers: int,
         cell: Literal["rnn", "lstm", "gru"] = "rnn",
         use_attention: bool = False,
+        bidirectional: bool = False,
         **kwds,
     ) -> None:
-        if kwds.get("bidirectional", False):
-            raise NotImplementedError("Bidirectional RNNs are not supported.")
 
         super().__init__()
         self.max_length = max_length
@@ -487,10 +486,11 @@ class RecurrentApproximator(nn.Module):
             hidden_size,
             num_layers,
             batch_first=True,
+            bidirectional=bidirectional,
             **kwds,
         )
         self.decoder: nn.RNN | nn.LSTM | nn.GRU = cell(
-            2 * hidden_size if use_attention else hidden_size,
+            (2 if use_attention else 1) * hidden_size,
             hidden_size,
             num_layers,
             batch_first=True,
@@ -518,11 +518,28 @@ class RecurrentApproximator(nn.Module):
     def encode(self, embeddings: Tensor) -> tuple[Tensor, Tensor, Optional[Tensor]]:
         if embeddings.dim() != 3:
             raise ShapeError((embeddings.shape), ("B", "T", "H"))
-        encoder_states = None
+
+        output = self.encoder.forward(embeddings)
         if isinstance(self.encoder, nn.LSTM):
-            encoder_outputs, (encoder_hidden, encoder_states) = self.encoder.forward(embeddings)
+            encoder_outputs = output[0]     # (B, T, H * D)
+            encoder_hidden  = output[1][0]  # (L * D, B, H)
+            encoder_states  = output[1][1]  # (L * D, B, H)
         else:
-            encoder_outputs, encoder_hidden = self.encoder.forward(embeddings)
+            encoder_outputs = output[0]     # (B, T, H * D)
+            encoder_hidden  = output[1]     # (L * D, B, H)
+            encoder_states  = None          # (L * D, B, H)
+
+        if self.encoder.bidirectional:
+            B = embeddings.size(0)
+            T = embeddings.size(1)
+            H = self.encoder.hidden_size
+            L = self.encoder.num_layers
+
+            encoder_outputs = encoder_outputs.view(B, T, 2, H).mean(dim=2)     # (B, T, H)
+            encoder_hidden  = encoder_hidden.view(L, 2, B, H).mean(dim=1)      # (L, B, H)
+            if encoder_states is not None:
+                encoder_states  = encoder_states.view(L, 2, B, H).mean(dim=1)  # (L, B, H)
+
         return encoder_outputs, encoder_hidden, encoder_states
 
     def predict_length(self, encoder_outputs: Tensor) -> Tensor:
@@ -1032,7 +1049,9 @@ def main() -> None:
     parser = TrainerArgumentParser()
     parser.add_argument("--max_length", type=int, default=64, help=".")
     parser.add_argument("--seed", type=int, default=0, help=".")
-    parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "rnn", "lstm", "gru", "rnn-att", "lstm-att", "gru-att"], help=".")
+    parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "rnn", "lstm", "gru"], help=".")
+    parser.add_argument("--use_attention", action="store_true", help=".")
+    parser.add_argument("--bidirectional", action="store_true", help=".")
     parser.add_argument("--arch_config", type=str, default="puny", choices=["puny", "tiny", "small", "medium", "large", "huge"], help=".")
     parser.add_argument("--pair_mode", type=str, default="single_hops", choices=["single_hops", "hops", "chains"], help=".")
     parser.add_argument("--tr_num_samples", type=int, default=sys.maxsize, help=".")
@@ -1086,13 +1105,20 @@ def main() -> None:
     print(f"Length Scaler: {length_scaler}")
 
     if args.arch == "transformer":
-        config = {"max_length": args.max_length} | getattr(TransformerApproximator, args.arch_config.upper())
+        config = {
+            "max_length": args.max_length,
+        } | getattr(TransformerApproximator, args.arch_config.upper())
         model = TransformerApproximator(**config)
         if args.arch_config in ("tiny", "small"):
             ...
             # BACKEND = SDPBackend.MATH
     else:
-        config = {"max_length": args.max_length, "cell": args.arch.split("-")[0], "use_attention": "att" in args.arch} | getattr(RecurrentApproximator, args.arch_config.upper())
+        config = {
+            "max_length": args.max_length,
+            "cell": args.arch,
+            "use_attention": args.use_attention,
+            "bidirectional": args.bidirectional,
+        } | getattr(RecurrentApproximator, args.arch_config.upper())
         model = RecurrentApproximator(**config)
 
     print(f"Model:\n{model}")
