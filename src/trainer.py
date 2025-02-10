@@ -23,6 +23,7 @@ import warnings
 import torch
 from torch import Tensor
 from torch.nn import Module
+from torch.nn.utils.rnn import pad_sequence
 from torch.optim import Optimizer, AdamW
 from torch.optim.lr_scheduler import ExponentialLR, LRScheduler, SequentialLR, ConstantLR, LinearLR, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, IterableDataset, Subset
@@ -38,8 +39,10 @@ class TrainerArgs:
     vl_batch_size: int = 2
     learning_rate: float = 1e-3
     num_workers: int = 0
+    pin_memory: bool = True
     disable_tqdm: bool = False
     logging_steps: int = -1
+    silent: bool = False
     metric: str = "vl_loss"
     lower_is_worse: bool = False
     max_norm: float = 1.0
@@ -47,6 +50,9 @@ class TrainerArgs:
     find_executable_batch_size: bool = False
     teacher_ratio_start: float = 1.0
     teacher_ratio_end: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.disable_tqdm = self.disable_tqdm or self.silent
 
 
 class TrainerArgumentParser(ArgumentParser):
@@ -60,6 +66,7 @@ class TrainerArgumentParser(ArgumentParser):
         self.add_argument("--vl_batch_size", type=int, default=2)
         self.add_argument("--learning_rate", type=float, default=1e-3)
         self.add_argument("--num_workers", type=int, default=0)
+        self.add_argument("--pin_memory", action="store_true")
         self.add_argument("--disable_tqdm", action="store_true")
         self.add_argument("--logging_steps", type=int, default=-1)
         self.add_argument("--metric", type=str, default="vl_loss")
@@ -215,7 +222,7 @@ def find_executable_batch_size(
 
 class Trainer(ABC):
     """A generic Trainer class for training models.
-    
+
     Note that this class requires DataLoader.drop_last_batch to be True, as the logic for averaging
     metrics assumes that the batch size is constant.
     """
@@ -317,6 +324,8 @@ class Trainer(ABC):
             if any(math.isnan(d[m]) or math.isinf(d[m]) for m in ("tr_loss", "vl_loss")):
                 raise ValueError("NaN/Inf Loss Detected!")
 
+        return self
+
     def evaluate_saved_models(self, epochs: Optional[list[int]] = None) -> None:
 
         @find_executable_batch_size(
@@ -345,13 +354,15 @@ class Trainer(ABC):
             vl_metrics = evaluate()
             results = {"epoch": epoch} | vl_metrics
             self.log.append(results)
-            print(self._fmt_dict(results))
+            if not self.args.silent:
+                print(self._fmt_dict(results))
             with open(outfile, "a") as fp:
                 fp.write(json.dumps(results) + "\n")
 
     def update_logs(self, results: dict[str, float]) -> None:
         self.log.append(results)
-        print(self._fmt_dict(results))
+        if not self.args.silent:
+            print(self._fmt_dict(results))
         with open(self.args.outdir / "results.jsonl", "a") as fp:
             fp.write(json.dumps(results) + "\n")
 
@@ -383,14 +394,17 @@ class Trainer(ABC):
         pbar = self._get_pbar(dataloader, total=len(dataloader), desc="Training...", leave=False)
         for mini_step, batch in enumerate(pbar):
 
+            batch = self.batch_to_device(batch)
+
             # Compute normalized loss, skip noisy losses
             outputs = self.forward(batch)
             loss, losses = self.compute_loss(batch, outputs)
             loss = loss / self.args.gradient_accumulation_steps
             losses = {k: v / self.args.gradient_accumulation_steps for k, v in losses.items()}
+            # NOTE: this could theoretically cause the weights to never step, which should probably be handled.
             if math.isnan(loss.item()) or math.isinf(loss.item()):
                 warnings.warn(f"NaN/Inf Loss Detected! {mini_step=} loss={loss.item()}")
-                continue  # TODO: could theoretically cause the weights to never step
+                continue
             loss.backward()
 
             # Add to running metrics
@@ -440,6 +454,8 @@ class Trainer(ABC):
             inputs = defaultdict(list)
             for step, batch in enumerate(pbar):  # pylint: disable=unused-variable
 
+                batch = self.batch_to_device(batch)
+
                 outputs = self.forward_eval(batch)
                 loss, losses = self.compute_loss(batch, outputs)
                 for k, v in self.get_compute_metrics_inputs(batch, outputs).items():
@@ -483,6 +499,18 @@ class Trainer(ABC):
             dict[str, float]: auxillary losses over the batch.
         """
 
+    # TODO: implement in subclasses and adjust their methods accordingly.
+    def batch_to_device(self, batch: tuple) -> tuple:
+        """Send a batch of inputs to the associated device.
+
+        Args:
+            batch (tuple): batch of inputs.
+
+        Returns:
+            tuple: same batch of inputs on the device.
+        """
+        return tuple(x.to(self.args.device) for x in batch)
+
     def compute_metrics(self, **kwds: list[Any]) -> dict[str, float]:  # pylint: disable=unused-argument
         """Compute the validation metrics over a set of examples.
 
@@ -513,7 +541,7 @@ class Trainer(ABC):
             shuffle,
             num_workers=self.args.num_workers,
             collate_fn=self.collate_fn,
-            pin_memory=True,
+            pin_memory=self.args.pin_memory,
             drop_last=True,
         )
 
@@ -530,3 +558,21 @@ class Trainer(ABC):
 
     def _fmt_dict(self, d: dict[str, float]) -> dict[str, str]:
         return {k: f"{v:.6f}" if isinstance(v, float) else v for k, v in d.items()}
+
+
+class ListDataset(Dataset):
+
+    def __init__(self, *lists: list[Tensor]) -> None:
+        self.lists = lists
+
+    def __len__(self) -> int:
+        return len(self.lists[0])
+
+    def __getitem__(self, idx: int) -> tuple[Tensor]:
+        return tuple(l[idx] for l in self.lists)
+
+
+def collate_fn_with_basic_padding(batch: list[tuple[Tensor, Tensor]], padding_value: float | int = 0.0) -> tuple[Tensor, Tensor]:
+    x = pad_sequence([b[0] for b in batch], batch_first=True, padding_value=padding_value)
+    y = torch.stack([b[1] for b in batch]).to(torch.float32)
+    return x, y
