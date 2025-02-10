@@ -64,15 +64,17 @@ import warnings
 from geomloss import SamplesLoss
 import numpy as np
 from scipy import stats
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn, Tensor
+from torch.nn import Module, BCEWithLogitsLoss
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, IterableDataset, Subset, random_split
 from tqdm import tqdm
 
 # pylint: disable=wrong-import-position
@@ -81,7 +83,7 @@ if __name__ == "__main__":
 
 from src.data import load_data
 from src.metrics import regression_report
-from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser, TeacherRatioScheduler, EarlyStopper, get_lr_scheduler
+from src.trainer import TrainerArgs, Trainer, TrainerArgumentParser, TeacherRatioScheduler, ListDataset, EarlyStopper, get_lr_scheduler, collate_fn_with_basic_padding
 from src.utils import (
     count_parameters,
     seed_everything,
@@ -327,26 +329,63 @@ class ApproximatorLossFn(nn.Module):
 
 class ApproximatorDiscriminator(nn.Module):
 
-    def __init__(self,  num_channels: int = 1,  conv_filters: int = 16, hidden_dim: int = 32) -> None:
+    def __init__(self, filter_size: int = 16, hidden_size: int = 32) -> None:
         super().__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv1d(in_channels=num_channels, out_channels=conv_filters, kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(in_channels=1, out_channels=filter_size, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            # nn.Conv1d(in_channels=conv_filters, out_channels=conv_filters, kernel_size=3, stride=1, padding=1),
-            # nn.ReLU(),
+            nn.Conv1d(in_channels=filter_size, out_channels=filter_size, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(1),
         )
         self.head = nn.Sequential(
-            nn.Linear(conv_filters, hidden_dim),
+            nn.Linear(filter_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_size, 1),
         )
 
     def forward(self, x: Tensor) -> Tensor:
+        if x.dim() != 2:
+            raise ShapeError((x.shape), ("B", "T"))
+        x = x.unsqueeze(1)
         x = self.conv(x)
-        x = torch.mean(x, dim=-1)
+        x = x.squeeze(2)
         x = self.head(x)
+        x = x.squeeze(1)
         return x
+
+
+class ApproximatorDiscriminatorTrainer(Trainer):
+
+    def forward(self, batch: tuple) -> tuple:
+        return (self.model.forward(batch[0]),)
+
+    def compute_loss(self, batch: tuple, outputs: tuple) -> tuple[Tensor, dict[str, float]]:
+        return self.loss_fn.forward(outputs[0], batch[1]), {}
+
+    def compute_metrics(self, y_true: list[Tensor], y_logits: list[Tensor]) -> dict[str, float]:  # pylint: disable=arguments-differ
+        y_prob = torch.sigmoid(torch.stack(y_logits)).to(torch.float32).numpy(force=True)
+        y_true = torch.stack(y_true).to(torch.int32).numpy(force=True)
+        return {"roc_auc": float(roc_auc_score(y_true, y_prob))}
+
+    def get_compute_metrics_inputs(self, batch: tuple, outputs: tuple) -> dict[str, list]:
+        return {
+            "y_true": [b for b in batch[1]],      # pylint: disable=unnecessary-comprehension
+            "y_logits": [b for b in outputs[0]],  # pylint: disable=unnecessary-comprehension
+        }
+
+    @staticmethod
+    def build_tr_vl_datasets(
+        y_true: list[Tensor],
+        y_pred: list[Tensor],
+        lengths: tuple[float, float] = (0.75, 0.25),
+    ) -> tuple[Dataset, Dataset]:
+        x = list(y_true) + list(y_pred)
+        y = [torch.tensor(0) for _ in y_true] + [torch.tensor(1) for _ in y_pred]
+        dataset = ListDataset(x, y)
+        tr_dataset, vl_datset = random_split(dataset, lengths)
+        return tr_dataset, vl_datset
 
 
 class Approximator(Protocol):
@@ -953,38 +992,52 @@ class ApproximatorTrainer(Trainer):
         y_true: list[Tensor],
         y_pred_tch: list[Tensor],
         y_pred_gen: list[Tensor],
+        length_true: list[Tensor],
         length_pred: list[Tensor],
     ) -> dict[str, float]:
-        if not len(y_true) == len(y_pred_tch) == len(y_pred_gen):
-            raise ValueError(f"Lengths of {y_true=}, {y_pred_tch=}, and {y_pred_gen=} do not match.")
 
-        y_true     = remove_padding(y_true)
-        y_pred_tch = remove_padding(y_pred_tch)
-        y_pred_gen = remove_padding(y_pred_gen)
-
-        NUM = len(y_true)                            # Number of sequences
-        MET = ("r2", "mae", "mse", "nrmse", "ndev")  # Metrics
+        device = "cpu" if False else self.args.device  # pylint: disable=using-constant-test
 
         metrics = {}
+
+        # Prepare the inputs and targets for metric computation.
+        y_true     = [z.to(device) for z in remove_padding(y_true)]
+        y_pred_tch = [z.to(device) for z in remove_padding(y_pred_tch)]
+        y_pred_gen = [z.to(device) for z in remove_padding(y_pred_gen)]
+        length_pred = torch.stack(length_pred).unsqueeze(1).numpy(force=True)
+        length_pred = torch.tensor(self.length_scaler.inverse_transform(length_pred), device=device).squeeze(1)
+        length_true = torch.stack(length_true).to(device)
+
+        # Mean absolute error for the length prediction.
+        mae = torch.abs(length_pred - length_true).mean()
+        metrics["length_mae"] = mae.item()
+
+        # Compute the next metrics for both the teacher-forced and organically generated flow translation.
         for (name, y_pred) in zip(("tch", "gen"), (y_pred_tch, y_pred_gen)):
-
-            # Compute the length metrics, not considering the length added by BOS and EOS tokens.
-            y_tr = torch.tensor([len(y) for y in y_true], dtype=torch.float32).numpy(force=True) - 2
-            y_pr = self.length_scaler.inverse_transform(torch.tensor(length_pred).unsqueeze(1).numpy(force=True), 1).squeeze(1)
-            m = regression_report(y_tr, y_pr)
-            metrics.update({f"{name}_length_{k}": v for k, v in m.items() if k in MET})
-
-            # Compute the timing metrics over the shorter of the two sequences, excluding BOS and EOS tokens.
-            lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(NUM)], dtype=torch.float32)
+            # Mean absolute error for the flow translation.
+            lengths = torch.tensor([[len(y_true[i]), len(y_pred[i])] for i in range(len(y_true))], dtype=torch.float32)
             minimum = torch.minimum(lengths[:,0], lengths[:,1]).to(torch.int64).tolist()
             y_tr = torch.cat([y_true[i][1:l-1] for i, l in enumerate(minimum)])
             y_pr = torch.cat([y_pred[i][1:l-1] for i, l in enumerate(minimum)])
-            for tok in (BOS, EOS, PAD):
-                for ten in (y_tr, y_pr):
-                    if (ten == tok).any():
-                        raise RuntimeError(f"{tok=} found in {ten.tolist()=}")
-            m = regression_report(y_tr.numpy(force=True), y_pr.numpy(force=True))
-            metrics.update({f"{name}_timing_{k}": v for k, v in m.items() if k in MET})
+            rmse = torch.sqrt(torch.mean(torch.square(y_pr - y_tr)))
+            metrics[f"{name}_timing_rmse"] = rmse.item()
+
+            # Imperceptibility, i.e., 1 - the performance of a very basic discriminator.
+            tr_dataset, vl_dataset = ApproximatorDiscriminatorTrainer.build_tr_vl_datasets(y_true, y_pred)
+            trainer = ApproximatorDiscriminatorTrainer(
+                args=TrainerArgs(
+                    device=self.args.device, tr_batch_size=64, vl_batch_size=64, pin_memory=False,
+                    metric="vl_roc_auc", lower_is_worse=True,
+                    epochs=10, disable_tqdm=True, logging_steps=-1, silent=True,
+                ),
+                model=ApproximatorDiscriminator(),
+                tr_dataset=tr_dataset,
+                vl_dataset=vl_dataset,
+                collate_fn=collate_fn_with_basic_padding,
+                loss_fn=BCEWithLogitsLoss(),
+            )
+            trainer = trainer()
+            metrics[f"{name}_timing_imp"] = 1.0 - trainer.best_metric
 
         return metrics
 
@@ -993,6 +1046,7 @@ class ApproximatorTrainer(Trainer):
             "y_true": [t for t in batch[1]],         # pylint: disable=unnecessary-comprehension
             "y_pred_tch": [t for t in outputs[0]],   # pylint: disable=unnecessary-comprehension
             "y_pred_gen": [t for t in outputs[1]],   # pylint: disable=unnecessary-comprehension
+            "length_true": [t for t in batch[2]],    # pylint: disable=unnecessary-comprehension
             "length_pred": [t for t in outputs[2]],  # pylint: disable=unnecessary-comprehension
         }
 
