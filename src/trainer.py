@@ -52,7 +52,9 @@ class TrainerArgs:
     teacher_ratio_end: float = 1.0
 
     def __post_init__(self) -> None:
-        self.disable_tqdm = self.disable_tqdm or self.silent
+        if self.silent:
+            self.disable_tqdm = True
+            self.logging_steps = -1
 
 
 class TrainerArgumentParser(ArgumentParser):
