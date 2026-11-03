@@ -1,7 +1,3 @@
-# README
-
-Unofficial implementation of the network watermarking technique, "FINN". This code is not endorsed by the original authors and comes with aboslutely no guarentees or warranty.
-
 # FISSIONN: Fingerprinting Stepping Stone Intrusions with Neural Networks.
 
 Codebase for our poster "Modeling Stepping-Stone Flows using Stochastic Random Walks and Black Box Neural Networks".
@@ -76,11 +72,4 @@ CITATION
   year={2024},
   howpublished={Poster presented at the IEEE Western New York Image and Signal Processing Workshop (WNYISPW), Rochester, NY},
   note={\url{https://github.com/lkurlandski/FISSIONN}}
-}
-
-@inproceedings{rezaei2021finn,
-  title={FINN: Fingerprinting network flows using neural networks},
-  author={Rezaei, Fatemeh and Houmansadr, Amir},
-  booktitle={Proceedings of the 37th Annual Computer Security Applications Conference},
-  year={2021}
 }
