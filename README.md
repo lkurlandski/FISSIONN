@@ -66,6 +66,7 @@ Or all at once using
 
 CITATION
 --------
+```
 @misc{kurlandski2024modeling,
   title={Modeling Stepping-Stone Flows using Stochastic Random Walks and Black Box Neural Networks},
   author={Kurlandski, Luke and Matthews, Nate and Hopper, Nicholas and Wright, Matthew},
@@ -73,3 +74,4 @@ CITATION
   howpublished={Poster presented at the IEEE Western New York Image and Signal Processing Workshop (WNYISPW), Rochester, NY},
   note={\url{https://github.com/lkurlandski/FISSIONN}}
 }
+```
